@@ -1,206 +1,304 @@
-# Financial RAG - 金融领域 RAG 知识库问答系统
+# Financial RAG — 金融领域 RAG 知识库问答系统
 
-> 基于 SiliconFlow + ChromaDB 的金融领域检索增强生成系统
+> 基于 MiMo + ChromaDB + Neo4j 的金融领域检索增强生成系统
 
-## 项目简介
+金融文档知识库问答系统。通过混合检索 + 知识图谱 + 自我修正，结合大语言模型生成专业、准确的金融问答。支持 Agent 多步推理、MCP 协议接入、全链路可观测性。
 
-构建一个金融领域的 RAG（Retrieval-Augmented Generation）知识库问答系统。通过检索金融文档（新闻、研报、Q&A）中的相关内容，结合大语言模型生成专业、准确的金融问答。
+## Performance Highlights
 
-### 核心特性
-
-- **混合检索**：BM25 关键词检索 + 向量语义检索 + RRF 融合，覆盖语义匹配和精确匹配
-- **本地重排序**：BGE-reranker-v2-m3 Cross-Encoder 二次精排，粗排精排分离，无需 API 调用
-- **四层自我修正**：检索门控 → 规则预检 → Claim NLI → 外部验证，多层级幻觉检测与修正
-- **Query Rewriting**：多轮对话指代消解，将指代性问题改写为独立检索 query
-- **语义级缓存**：基于 Embedding 余弦相似度的查询缓存，相似问题直接命中
-- **asyncio 全链路异步**：双路检索 asyncio.gather 并行，API 调用全异步化
-- **双入口架构**：Streamlit Web UI + FastAPI REST API（Swagger 文档自动生成）
-- **RAGAS 自动化评估**：Faithfulness / Relevancy / Precision / Recall 四维评测
-- **实时 Metrics**：查询延迟 P50/P95、Token 消耗、缓存命中率实时监控
-
-## 技术选型
-
-| 组件 | 技术方案 | 说明 |
-|---|---|---|
-| LLM | **SiliconFlow Qwen3-8B** | OpenAI 兼容接口，永久免费 |
-| Embedding | **SiliconFlow BAAI/bge-large-zh-v1.5** | 中文语义向量，免费额度 |
-| Rerank | **本地 BGE-reranker-v2-m3** | Cross-Encoder 精排，本地运行无需 API |
-| 向量数据库 | **ChromaDB** | 轻量级，内置持久化，本地运行 |
-| 关键词检索 | **rank_bm25 + jieba** | BM25 倒排索引，金融领域分词优化 |
-| 检索融合 | **RRF (Reciprocal Rank Fusion)** | 双路召回排名融合，天然兼容不同分数尺度 |
-| Web 框架 | **Streamlit** + **FastAPI** | UI 演示 + REST API 双入口 |
-| RAG 评估 | **RAGAS** | 自动化评测 Faithfulness / Relevancy 等 |
-| 配置管理 | **PyYAML + python-dotenv** | YAML 配置 + .env 环境变量 |
-| 代码质量 | **ruff + mypy + pytest** | Linting + 类型检查 + 200+ 单元测试 |
-| 部署 | **Docker + GitHub Actions CI** | 容器化部署 + 自动化测试流水线 |
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| Faithfulness | **0.82** | Self-Correction 启用后，较 baseline +1.8% |
+| Context Precision | **0.73** | 混合检索 RRF 融合 |
+| Reranker 提升 | **+15.3%** | Faithfulness 从 0.66 → 0.76 |
+| 纯检索延迟 | **< 500ms** | 含 Embedding + ChromaDB + BM25 |
+| Cache 命中延迟 | **< 100ms** | FactCache 结构化缓存命中时 |
+| 测试覆盖 | **446 tests** | ruff + mypy 零错误 |
 
 ## 系统架构
 
+```mermaid
+graph TB
+    subgraph "用户入口"
+        UI[Gradio 4.x Web UI]
+        API[FastAPI REST API]
+        WS[WebSocket Stream]
+        MCP[MCP Server]
+    end
+
+    subgraph "查询路由"
+        CR{CacheRouter}
+        GR{GraphRouter}
+    end
+
+    subgraph "检索引擎"
+        BM25[BM25 关键词检索]
+        VEC[向量语义检索]
+        RRF[RRF 融合排序]
+        RK[BGE-reranker 精排]
+    end
+
+    subgraph "知识层"
+        FC[FactsCache 结构化缓存]
+        KG[Neo4j 知识图谱]
+        DB[(ChromaDB 向量库)]
+    end
+
+    subgraph "生成与修正"
+        LLM[MiMo-V2-Pro LLM]
+        SC[四层自我修正]
+    end
+
+    subgraph "Agent"
+        RA[ReAct Agent]
+        T1[financial_search]
+        T2[knowledge_graph]
+        T3[calculator]
+    end
+
+    subgraph "可观测性"
+        LF[Langfuse Trace]
+    end
+
+    UI --> CR
+    API --> CR
+    WS --> CR
+    MCP --> CR
+
+    CR -->|命中| FC
+    CR -->|未命中| GR
+    GR -->|图谱查询| KG
+    GR -->|文本检索| BM25
+    GR -->|文本检索| VEC
+    BM25 --> RRF
+    VEC --> RRF
+    RRF --> RK
+    RK --> LLM
+    LLM --> SC
+
+    RA --> T1
+    RA --> T2
+    RA --> T3
+
+    SC --> LF
+    RA --> LF
+
+    VEC -.-> DB
+    BM25 -.-> DB
 ```
-用户提问 → Streamlit Web UI / FastAPI REST API
-    │
-    ▼
-文档处理 Pipeline
-  加载(PDF/TXT/QA) → 分块(段落/标题) → 清洗 → 元数据标注
-    │
-    ▼
-SiliconFlow BAAI/bge-large-zh-v1.5 → 文本向量化 → ChromaDB 持久化
-    │
-    ▼
-混合检索器 (HybridRetriever)
-  ├─ 向量检索 (ChromaDB 语义匹配)
-  ├─ BM25 检索 (jieba 分词 + 关键词匹配)
-  └─ RRF 融合 (加权合并两路排名)
-    │
-    ▼
-重排序 (可选) → 本地 BGE-reranker-v2-m3 精排
-    │
-    ▼
-Prompt 构造 → System Prompt + 检索文档 + 用户问题
-    │
-    ▼
-SiliconFlow Qwen3-8B → 生成回答（附引用来源）
-    │
-    ▼
-自我修正 (可选) → 四层幻觉检测与修正
-```
+
+**Agent 模式**走独立的 ReAct 循环：`Thought → Action (financial_search / knowledge_graph / calculator) → Observation`，最多 6 步推理。
+
+## 核心特性
+
+- **混合检索** — BM25 关键词 + 向量语义 + RRF 融合，兼顾精确匹配与语义匹配
+- **GraphRAG** — 实体关系三元组 + Neo4j/NetworkX 双后端 + 图路由自动判断
+- **ReAct Agent** — 手写 ReAct 循环（60 行核心），3 种工具（检索/图谱/计算器），最多 6 步推理
+- **四层自我修正** — 检索门控 → 规则预检 → Claim NLI → 外部验证
+- **缓存增强 (CAG)** — FactCache 结构化知识缓存，命中时跳过检索
+- **MCP Server** — RAG 能力封装为 MCP 工具，Claude Desktop / Cursor 可直接调用
+- **全链路追踪** — Langfuse Trace/Span，每次 query 可回溯诊断
+- **多入口** — Gradio 4.x（推荐）+ Streamlit（兼容）+ FastAPI REST + WebSocket 流式
+- **446 测试** — ruff + mypy 零错误，pytest 全通过
+
+## 技术选型
+
+| 组件 | 方案 | 说明 |
+|------|------|------|
+| LLM | **MiMo-V2-Pro** | 小米自研大模型，OpenAI 兼容接口 |
+| Embedding | **bge-large-zh-v1.5** | 中文语义向量（SiliconFlow 托管） |
+| Rerank | **BGE-reranker-v2-m3** | Cross-Encoder 精排，本地运行 |
+| 向量库 | **ChromaDB** | 轻量级，内置持久化 |
+| 知识图谱 | **Neo4j** / NetworkX | Cypher 查询，工厂模式切换 |
+| 检索融合 | **RRF** | 双路召回排名融合 |
+| Web UI | **Gradio 4.x** | 流式输出 + 深色金融主题 |
+| API | **FastAPI** | REST + WebSocket 双协议 |
+| 可观测性 | **Langfuse** | 全链路 Trace/Span |
+| Agent 协议 | **MCP** | 工具服务，支持 Claude Desktop |
+| 代码质量 | **ruff + mypy + pytest** | 446 单元测试 |
 
 ## 项目结构
 
 ```
 financial-rag/
-├── app.py                      # Streamlit 主入口
+├── app.py                      # Streamlit 入口（兼容）
 ├── config.yaml                 # 全局配置
-├── requirements.txt            # Python 依赖
-├── pyproject.toml              # 包管理 + ruff/mypy 配置
-├── Dockerfile                  # Docker 镜像构建
-├── docker-compose.yml          # Docker Compose 编排
+├── requirements.txt
+├── pyproject.toml              # ruff / mypy 配置
+├── Dockerfile
+├── docker-compose.yml
 │
-├── src/
+├── src/                        # 10,800+ 行源码
 │   ├── config.py               #   配置加载（YAML + .env）
-│   ├── utils.py                #   API 重试、错误分类
 │   ├── rag_pipeline.py         #   RAG 主流程（同步 + async）
-│   ├── index_builder.py        #   文档索引构建器
-│   ├── loaders/                #   文档加载（TXT/PDF/QA）
-│   ├── processor/              #   文本清洗 + 分块（段落/标题双策略）
-│   ├── embeddings/             #   SiliconFlow Embedding（同步 + async）
+│   ├── generator/              #   MiMo LLM + Query Rewriting
+│   ├── embeddings/             #   SiliconFlow Embedding
 │   ├── vectorstore/            #   ChromaDB 封装
-│   ├── retriever/              #   向量 / BM25 / 混合检索（RRF 融合）
-│   ├── reranker/               #   本地 BGE-reranker 精排（同步 + async）
-│   ├── generator/              #   Qwen3-8B 生成 + Query Rewriting
+│   ├── retriever/              #   向量 / BM25 / 混合检索
+│   ├── reranker/               #   BGE-reranker 精排
 │   ├── correction/             #   四层自我修正
 │   ├── cache/                  #   语义级查询缓存
-│   ├── api/                    #   FastAPI REST API
-│   │   ├── app.py
-│   │   ├── schemas.py
-│   │   └── routes/
-│   ├── metrics/                #   Metrics 收集器
-│   ├── ui/                     #   Streamlit UI 模块
+│   ├── fact_cache/             #   FactCache 结构化知识缓存
+│   ├── fact_extractor/         #   Fact + Triple 联合提取
+│   ├── graph/                  #   GraphRAG（Neo4j/NetworkX）
+│   ├── agent/                  #   ReAct Agent + 工具集
+│   ├── observability/          #   Langfuse 追踪
+│   ├── mcp_server/             #   MCP Server
+│   ├── api/                    #   FastAPI REST + WebSocket
+│   ├── ui_gradio/              #   Gradio 4.x UI（推荐）
+│   ├── ui/                     #   Streamlit UI（兼容）
 │   └── evaluation/             #   RAGAS 评估
 │
-├── scripts/
-│   └── benchmark.py            #   Benchmark 脚本
+├── docs/                       # 文档
+│   ├── adr/                    #   架构决策记录（7 篇）
+│   ├── stages/                 #   分阶段开发文档
+│   │   ├── graphrag/           #     GraphRAG 阶段 1-5
+│   │   ├── agent/              #     Agent 阶段 1-5
+│   │   └── upgrade/            #     竞争力升级阶段 1-7
+│   └── mcp_integration_guide.md
 │
-├── tests/                      #   200+ 单元测试
-└── data/eval/                  #   50+ 条评估数据集
+├── scripts/
+│   ├── benchmark.py            #   RAGAS 评测
+│   └── agent_benchmark.py      #   Agent LLM-as-Judge
+│
+├── tests/                      #   446 单元测试
+└── data/eval/                  #   50+ 条评测数据集
 ```
 
 ## 快速开始
 
 ```bash
-# 1. 克隆项目
-git clone https://github.com/Alfroul/financial-rag.git
-cd financial-rag
+# 1. 克隆
+git clone https://github.com/Alfroul/financial-rag.git && cd financial-rag
 
-# 2. 创建虚拟环境
-python -m venv venv
-venv\Scripts\activate       # Windows
-# source venv/bin/activate  # Linux/Mac
-
-# 3. 安装依赖
+# 2. 环境
+python -m venv venv && venv\Scripts\activate  # Windows
 pip install -r requirements.txt
 
-# 4. 配置 API Key
+# 3. 配置
 cp .env.example .env
-# 编辑 .env，填入 SiliconFlow API Key
+# 编辑 .env，填入 MIMO_API_KEY
 
-# 5. 启动应用
+# 4. 启动（推荐 Gradio）
+python -m src.ui_gradio.app
+
+# 或 Streamlit（兼容）
 streamlit run app.py
+
+# 或 FastAPI
+python -m uvicorn src.api.app:app --reload --port 8000
 ```
 
-### API Key 获取
+### API Key
 
-1. 访问 [SiliconFlow](https://siliconflow.cn/)，注册/登录
-2. 进入「API Keys」页面，创建新的 Key
-3. 填入 `.env` 文件的 `SILICONFLOW_API_KEY` 字段
+| Key | 必填 | 获取 |
+|-----|------|------|
+| `MIMO_API_KEY` | 是 | [MiMo 平台](https://platform.xiaomimimo.com/) |
+| `SILICONFLOW_API_KEY` | 否 | [SiliconFlow](https://siliconflow.cn/)（Embedding 用，已内置 MiMo 兼容） |
+| `LANGFUSE_PUBLIC_KEY` / `SECRET_KEY` | 否 | [Langfuse Cloud](https://cloud.langfuse.com/)（不配置则禁用追踪） |
+| `NEO4J_PASSWORD` | 否 | Docker 启动时配置（不配置则用 NetworkX 回退） |
 
-> 也可以在 Streamlit 侧边栏直接输入 API Key。SiliconFlow 提供多款永久免费模型（Qwen3-8B、DeepSeek V3 等）。
+### MCP Server
 
-### Docker 部署
+详见 [`docs/mcp_integration_guide.md`](docs/mcp_integration_guide.md)。
+
+```bash
+python -m src.mcp_server.server                    # stdio（Claude Desktop）
+python -m src.mcp_server.server --sse --port 8080  # SSE（远程调用）
+```
+
+暴露 3 个 MCP Tools：`financial_search` / `knowledge_graph_query` / `financial_analysis`。
+
+### Docker
 
 ```bash
 docker-compose up --build
 ```
 
-访问 `http://localhost:8501`。数据目录通过 volume 挂载，容器重建不丢失数据。
+- Gradio：`http://localhost:7860`
+- Streamlit：`http://localhost:8501`
+- REST API：`http://localhost:8000/docs`
 
 ## 数据准备
 
 | 格式 | 目录 | 说明 |
-|---|---|---|
-| TXT / MD | `data/raw/news/` | 财经新闻、文本文章 |
-| PDF | `data/raw/reports/` | 研究报告、分析文档 |
-| JSON / CSV | `data/raw/qa/` | 结构化 Q&A 数据 |
+|------|------|------|
+| TXT / MD | `data/raw/news/` | 财经新闻 |
+| PDF | `data/raw/reports/` | 研究报告 |
+| JSON / CSV | `data/raw/qa/` | 结构化 Q&A |
 
-添加文档有两种方式：
-1. **Web UI**：在「文档管理」页面拖拽上传，点击「开始索引」
-2. **命令行**：将文件放入 `data/raw/` 对应目录，运行 `python -m src.index_builder`
+上传方式：Web UI「文档管理」页拖拽上传，或放入 `data/raw/` 后运行 `python -m src.index_builder`。
 
-## 配置说明
+## 配置
 
-主要配置项在 `config.yaml` 中：
+`config.yaml` 主要配置项：
 
 ```yaml
 llm:
-  model: "Qwen/Qwen3-8B"           # SiliconFlow 免费模型
+  model: "MiMo-V2-Pro"
   temperature: 0.7
   max_tokens: 2048
 
 embedding:
-  model: "BAAI/bge-large-zh-v1.5"  # 中文语义向量
-  batch_size: 20
+  model: "BAAI/bge-large-zh-v1.5"
 
 chunker:
-  chunk_size: 512                   # 分块大小 (tokens)
-  chunk_overlap: 100
-  strategy: "paragraph"             # paragraph / title
+  chunk_size: 512
+  strategy: "paragraph"     # paragraph / title
 
 hybrid:
-  strategy: "hybrid"                # vector / bm25 / hybrid
-  rrf_k: 60                         # RRF 融合常数
+  strategy: "hybrid"        # vector / bm25 / hybrid
+  rrf_k: 60
 
 reranker:
-  enabled: false                    # 本地 BGE-reranker 精排
+  enabled: false            # 本地 BGE-reranker 精排
   top_n: 5
 ```
 
+## API
+
+```bash
+python -m uvicorn src.api.app:app --reload --port 8000
+```
+
+Swagger UI：`http://localhost:8000/docs`
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/api/v1/query` | 同步查询 |
+| `POST` | `/api/v1/query/stream` | SSE 流式 |
+| `WebSocket` | `/api/v1/ws/chat` | 双向流式 |
+| `GET` | `/api/v1/health` | 健康检查 |
+| `POST` | `/api/v1/documents/upload` | 上传文档 |
+| `GET` | `/api/v1/documents/stats` | 文档统计 |
+
 ## Benchmark
 
-> 由 `scripts/benchmark.py` 自动生成，使用 RAGAS 框架评测。
+> `scripts/benchmark.py` + RAGAS 框架，50 条金融评测数据集。
 
-### 实验背景
+### 实验历史
 
-项目通过八轮 RAGAS 对比实验逐步优化检索与生成策略：
+| 轮次 | LLM | 重点 | 数据集 |
+|------|-----|------|--------|
+| 1-7 | GLM-4-flash | vector / BM25 / hybrid 对比 | 18 条 |
+| 8 | Qwen3-8B (SiliconFlow) | Self-Correction 效果 | 50 条 |
+| 9 | Qwen3-8b + GraphRAG | 图谱 + 重排序 | 50 条 |
 
-- **第 1~7 轮**：使用 GLM-4-flash 模型，在小数据集（18 条）上对比 vector / BM25 / hybrid 三种检索策略，确定混合检索（hybrid）为最优方案
-- **第 8 轮**：全面迁移至 SiliconFlow（Qwen3-8B + bge-large-zh-v1.5），在扩充数据集（50 条）上评估自我修正（Self-Correction）对准确率和延迟的影响
-
-### RAGAS 评估指标（第 8 轮，SiliconFlow）
+### 第 8 轮结果（Self-Correction 效果）
 
 | 配置 | 忠实度 | 答案相关性 | 上下文精确度 | 上下文召回率 |
 |------|--------|-----------|-------------|-------------|
 | hybrid | 0.8020 | 0.3165 | 0.6959 | 0.6151 |
-| hybrid + SelfCorrection | 0.8162 | 0.3278 | 0.7036 | 0.6188 |
+| hybrid + SelfCorrection | **0.8162** | **0.3278** | **0.7036** | **0.6188** |
+
+### 第 9 轮结果（检索策略对比）
+
+| 配置 | 忠实度 | 答案相关性 | 上下文精确度 | 上下文召回率 |
+|------|--------|-----------|-------------|-------------|
+| vector | 0.8010 | 0.3218 | 0.7034 | 0.6215 |
+| hybrid | 0.6609 | 0.3267 | 0.7302 | 0.6091 |
+| hybrid + Reranker | 0.7623 | 0.3298 | 0.6995 | 0.6341 |
+| hybrid + Graph | 0.6909 | 0.3251 | 0.6988 | 0.5985 |
 
 ### 检索延迟
 
@@ -213,81 +311,59 @@ reranker:
 
 ### 关键结论
 
-- Self-Correction 在所有四项指标上一致正向提升，无退化
-- 忠实度提升 1.8%（0.8020 → 0.8162），答案相关性提升 3.6%（0.3165 → 0.3278）
-- 推荐配置：**hybrid + SelfCorrection**
+- **推荐配置**：hybrid + SelfCorrection — 四项指标一致正向提升
+- Self-Correction：忠实度 +1.8%，答案相关性 +3.6%
+- Reranker 精排：忠实度从 0.66 提升到 0.76（+15.3%）
+- GraphRAG：忠实度从 0.66 提升到 0.69（+4.5%）
 
-## API 文档
+## 文档
 
-除 Streamlit UI 外，系统提供 REST API 接口：
-
-```bash
-# 启动 FastAPI 服务
-python -m uvicorn src.api.app:app --host 0.0.0.0 --port 8000 --reload
-```
-
-Swagger UI：`http://localhost:8000/docs`
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| `POST` | `/api/v1/query` | 同步查询 |
-| `POST` | `/api/v1/query/stream` | SSE 流式查询 |
-| `GET` | `/api/v1/health` | 健康检查 |
-| `POST` | `/api/v1/documents/upload` | 上传文档 |
-| `GET` | `/api/v1/documents/stats` | 文档统计 |
-| `GET` | `/api/v1/metrics` | Metrics 统计 |
-
-## FAQ
-
-**Q: 提示「API Key 无效」？**
-检查 Key 是否包含前后空格，建议到 [SiliconFlow](https://siliconflow.cn/) 重新生成。
-
-**Q: 上传文档后检索不到相关内容？**
-降低「相似度阈值」到 0.3，增加 Top-K 到 10，或对研报类文档切换为 title 分块策略。
-
-**Q: 混合检索比纯向量检索好在哪里？**
-向量检索擅长语义匹配（"股市表现"匹配"大盘走势"），BM25 擅长精确关键词匹配（"沪深300"匹配"HS300"）。混合检索通过 RRF 融合两路排名，覆盖面更广。
-
-**Q: 自我修正系统是什么？**
-四层幻觉检测机制：(1) 检索质量门控 — 低质量检索直接跳过；(2) 规则预检 — 数字/实体/日期零成本比对；(3) Claim NLI — 原子断言验证；(4) 外部模型验证 — 二次判定。开启后 Faithfulness 提升 1.8%。
-
-**Q: Reranker 开启后更慢怎么办？**
-Reranker 使用本地 BGE-reranker-v2-m3 运行，无需 API。首次加载需下载模型（约 600MB），后续推理约 0.5-1 秒。
-
-## 简历描述
-
-> **金融领域 RAG 知识库问答系统** | Python, FastAPI, Streamlit, ChromaDB, SiliconFlow
->
-> - 构建金融领域 RAG 系统，实现 BM25+向量混合检索（RRF 融合）+ 本地 BGE-reranker 二次精排 + 四层自我修正，Faithfulness 达 0.82
-> - 通过八轮 RAGAS 对比实验（GLM-4-flash × 7 轮 + SiliconFlow × 1 轮）验证混合检索为最优策略，Self-Correction 在四项指标上一致正向提升
-> - 实现 Query Rewriting 指代消解、语义级查询缓存、asyncio 全链路异步化，平均查询延迟 < 20s
-> - 双入口架构（Streamlit UI + FastAPI REST API），Docker 容器化部署，GitHub Actions CI，200+ 单元测试全通过
+| 文档 | 说明 |
+|------|------|
+| [`docs/adr/`](docs/adr/) | 架构决策记录（7 篇）：Neo4j 选型、Agent 设计、MiMo 迁移、Langfuse、Gradio、MCP |
+| [`docs/stages/graphrag/`](docs/stages/graphrag/) | GraphRAG 分阶段开发（5 阶段）：三元组提取 → 存储 → 检索 → 路由 → 集成 |
+| [`docs/stages/agent/`](docs/stages/agent/) | Agent 分阶段开发（5 阶段）：ReAct 循环 → 工具 → 解析器 → Task Classifier → 评测 |
+| [`docs/stages/upgrade/`](docs/stages/upgrade/) | 竞争力升级（7 阶段）：MiMo → Langfuse → Gradio → MCP → Neo4j → WebSocket → Review |
+| [`docs/mcp_integration_guide.md`](docs/mcp_integration_guide.md) | MCP Server 集成指南（Claude Desktop / Cursor 配置） |
 
 ## 面试高频问题
 
-### 为什么选择 RRF 融合而不是加权平均？
+### 为什么选 RRF 而不是加权平均？
 
-RRF 只依赖排名位置，不依赖原始分数，天然兼容不同检索器的分数尺度。BM25 分数和余弦相似度量纲不同，直接加权需要归一化。RRF 通过 `1/(k+rank)` 将排名转换为分数，简单且鲁棒，k=60 是常用经验值。
+RRF 只依赖排名位置，天然兼容不同检索器的分数尺度。BM25 和余弦相似度量纲不同，直接加权需要归一化。RRF 公式 `1/(k+rank)` 简单鲁棒，k=60 是经验值。
 
-### Query Rewriting 的降级策略？
+### 两阶段检索（粗排+精排）？
 
-改写失败（网络错误/超时/API 限额）时 catch 异常，直接用原始 query 检索。无历史记录时跳过改写步骤，不做额外 API 调用。
+向量检索是 Bi-Encoder（独立编码），速度快但精度有限。Reranker 是 Cross-Encoder（联合编码），精度高但慢。粗排 Top-30 → 精排 Top-5，兼顾速度和精度。
 
-### 语义级缓存和精确匹配缓存的区别？
+### GraphRAG 和普通 RAG 的区别？
 
-精确匹配只缓存完全相同的 query。语义级缓存用 Embedding 计算余弦相似度，"什么是GDP" 和 "GDP是什么意思" 相似度 > 0.95 会命中同一缓存，大幅提升命中率。
+普通 RAG 只检索文本片段，无法回答跨实体关系问题。GraphRAG 提取三元组建知识图谱，通过实体匹配和路径查询补充结构化上下文。GraphRouter 根据查询特征（对比词、因果词、已知实体）自动判断是否走图谱路径。
 
-### asyncio 异步化带来了什么？
+### ReAct Agent 设计思路？
 
-混合检索的向量和 BM25 两路原本串行，异步化后 asyncio.gather 并行，延迟从两路之和降到 max(两路)。加上 Embedding/LLM 全异步化，整体延迟降低约 40%。
+手写 ReAct 循环，不依赖 LangChain。3 个工具：`financial_search`（RAG）、`knowledge_graph`（图谱）、`calculator`（安全计算器）。最多 6 步推理，超步数强制总结。Task Classifier 在循环前处理边界情况。
 
-### 为什么用两阶段检索（粗排+精排）？
+### MCP Server 解决什么？
 
-向量检索是 Bi-Encoder（问题和文档独立编码），速度快但精度有限。Reranker 是 Cross-Encoder（联合编码），精度高但慢。先用粗排召回 Top-30，再用 Reranker 精排取 Top-5，兼顾速度和精度。
+MCP 是 Anthropic 主导的 Agent 交互标准。将 RAG 能力封装为 MCP Tools，Claude Desktop / Cursor 直接调用，无需了解内部实现。
 
-### ChromaDB 为什么不用 Milvus/Pinecone？
+### 语义缓存 vs 精确匹配缓存？
 
-ChromaDB 轻量级、内置持久化、本地运行无需额外服务，适合单机部署。Milvus 适合大规模生产，Pinecone 是托管付费服务。
+精确匹配只缓存完全相同的 query。语义缓存用 Embedding 余弦相似度，"什么是GDP" 和 "GDP是什么意思" 相似度 > 0.95 命中同一缓存，命中率大幅提升。
+
+### asyncio 异步化效果？
+
+混合检索双路 `asyncio.gather` 并行，延迟从两路之和降到 max。加上 Embedding/LLM 全异步，整体延迟降约 40%。
+
+## 简历描述
+
+> **金融领域 RAG 知识库问答系统** | Python, FastAPI, Gradio, ChromaDB, Neo4j, MiMo
+>
+> - 混合检索（BM25+向量 RRF 融合）+ BGE-reranker 精排 + 四层自我修正，Faithfulness 达 0.82（+15.3%）
+> - GraphRAG 知识图谱路径（Neo4j + 实体匹配 + 图路由），手写 60 行 ReAct Agent 多步推理
+> - FactCache 结构化缓存（命中延迟 <100ms），Langfuse 全链路追踪，MCP 协议接入
+> - Gradio + FastAPI + WebSocket 三入口，Docker Compose 部署，446 测试 + ruff/mypy 零错误
 
 ## License
 
