@@ -55,8 +55,12 @@ class RAGEvaluator:
         # Local imports to keep dependencies lazy and testable
         from datasets import Dataset
         from langchain_openai import OpenAIEmbeddings
-        from ragas import RunConfig
         from ragas import evaluate as ragas_evaluate
+
+        try:
+            from ragas import RunConfig
+        except ImportError:
+            RunConfig = None
         from ragas.metrics import (
             context_precision,
             context_recall,
@@ -83,15 +87,16 @@ class RAGEvaluator:
             api_key=self._embedding_api_key,  # type: ignore[arg-type]
         )
 
-        run_config = RunConfig(max_workers=2, max_retries=10, max_wait=60)
+        eval_kwargs: dict[str, Any] = {
+            "dataset": dataset,
+            "metrics": metrics,
+            "llm": self._get_llm(),
+            "embeddings": embeddings,
+        }
+        if RunConfig is not None:
+            eval_kwargs["run_config"] = RunConfig(max_workers=2, max_retries=10, max_wait=60)
 
-        eval_result = ragas_evaluate(
-            dataset,
-            metrics=metrics,
-            llm=self._get_llm(),
-            embeddings=embeddings,
-            run_config=run_config,
-        )
+        eval_result = ragas_evaluate(**eval_kwargs)
 
         # ragas 0.4+: EvaluationResult._repr_dict is {metric_name: average_score}
         if hasattr(eval_result, "_repr_dict"):
