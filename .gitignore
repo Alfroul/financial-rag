@@ -58,3 +58,22 @@ start_api.bat
 
 # OpenCode 会话文件
 .sisyphus/
+
+# Claude Code 会话文件
+.claude/
+
+# Omo 会话文件
+.omo/
+
+# 原始数据文件（含文档，体积大）
+data/raw/
+data/graph.pkl
+data/graph_store.pkl
+
+# 开发计划文件（非项目源码）
+plan.md
+plan-*.md
+CONTEXT.md
+
+# Benchmark 最终报告（本地记录）
+benchmark_results_final.md

@@ -8,8 +8,14 @@ from src.cache import QueryCache
 from src.config import Config, RetrieverConfig
 from src.correction.pipeline import SelfCorrectingPipeline
 from src.embeddings.siliconflow_embedder import SiliconFlowEmbedder
+from src.fact_cache.store import FactCacheStore
+from src.fact_extractor.extractor import FactExtractor
+from src.generator.mimo_llm import MimoLLM
 from src.generator.query_rewriter import QueryRewriter
-from src.generator.siliconflow_llm import SiliconFlowLLM
+from src.graph.entity_matcher import EntityMatcher
+from src.graph.graph_retriever import GraphRetriever
+from src.graph.graph_store import create_graph_store
+from src.observability.langfuse_tracer import LangfuseTracer
 from src.rag_pipeline import RAGPipeline
 from src.reranker.local_reranker import LocalRreranker
 from src.retriever.bm25_retriever import BM25Retriever
@@ -43,10 +49,11 @@ def _init_embedder(_api_key: str) -> SiliconFlowEmbedder:
 
 
 @st.cache_resource
-def _init_llm(_api_key: str, _model: str, _temperature: float, _max_tokens: int) -> SiliconFlowLLM:
-    return SiliconFlowLLM(
+def _init_llm(_api_key: str, _model: str, _temperature: float, _max_tokens: int) -> MimoLLM:
+    return MimoLLM(
         api_key=_api_key,
         model=_model,
+        base_url=config.llm.base_url,
         temperature=_temperature,
         max_tokens=_max_tokens,
     )
@@ -108,9 +115,40 @@ def _build_rag_pipeline(api_key: str) -> RAGPipeline | SelfCorrectingPipeline:
             max_size=config.cache.max_size,
         )
 
+    fact_cache = None
+    fact_extractor = None
+    if config.fact_cache.enabled:
+        fact_cache = FactCacheStore(
+            embedder=embedder,
+            collection_name=config.fact_cache.collection_name,
+        )
+        fact_extractor = FactExtractor(api_key=api_key)
+
+    graph_store = None
+    graph_retriever = None
+    if config.graph.enabled:
+        graph_store = create_graph_store(config.graph)
+        entity_matcher = EntityMatcher(embedder)
+        entity_matcher.build_index(graph_store.get_entities())
+        graph_retriever = GraphRetriever(
+            graph_store=graph_store,
+            entity_matcher=entity_matcher,
+            max_neighbors=config.graph.max_neighbors,
+            max_depth=config.graph.max_depth,
+        )
+
     reranker_config = None
     if st.session_state.reranker_enabled and config.reranker is not None:
         reranker_config = replace(config.reranker, top_n=st.session_state.reranker_top_n)
+
+    tracer = None
+    if config.langfuse.enabled:
+        tracer = LangfuseTracer(
+            enabled=config.langfuse.enabled,
+            public_key=config.langfuse.public_key,
+            secret_key=config.langfuse.secret_key,
+            host=config.langfuse.host,
+        )
 
     pipeline = RAGPipeline(
         retriever,
@@ -120,6 +158,13 @@ def _build_rag_pipeline(api_key: str) -> RAGPipeline | SelfCorrectingPipeline:
         reranker_config=reranker_config,
         query_rewriter=query_rewriter,
         cache=cache,
+        fact_cache=fact_cache,
+        fact_extractor=fact_extractor,
+        fact_cache_threshold=config.fact_cache.similarity_threshold,
+        graph_store=graph_store,
+        graph_config=config.graph,
+        graph_retriever=graph_retriever,
+        tracer=tracer,
     )
 
     if getattr(st.session_state, "self_correction_enabled", False):
@@ -132,7 +177,7 @@ def _wrap_self_correction(pipeline: RAGPipeline, api_key: str) -> SelfCorrecting
     return SelfCorrectingPipeline(
         pipeline=pipeline,
         config=config.self_correction,
-        api_key=config.siliconflow_api_key,
-        base_url=config.self_correction.siliconflow_base_url,
-        model=config.self_correction.siliconflow_model,
+        api_key=config.api_key,
+        base_url=config.self_correction.verifier_base_url,
+        model=config.self_correction.verifier_model,
     )

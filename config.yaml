@@ -1,9 +1,15 @@
 # LLM 模型配置
 llm:
-  model: "Qwen/Qwen3-8B"      # SiliconFlow 免费模型
+  model: "mimo-v2-pro"           # 小米 MiMo 旗舰模型
+  base_url: "https://token-plan-cn.xiaomimimo.com/v1"
+  api_key_env: "MIMO_API_KEY"    # 从环境变量读取 API Key
   temperature: 0.7
   max_tokens: 2048
   top_p: 0.9
+
+# MiMo API Key（从环境变量读取）
+mimo:
+  api_key_env: "MIMO_API_KEY"
 
 embedding:
   model: "BAAI/bge-large-zh-v1.5"  # SiliconFlow 免费中文 Embedding
@@ -69,11 +75,54 @@ cache:
   similarity_threshold: 0.95
   max_size: 100
 
+# 知识缓存配置（阶段 1）
+fact_cache:
+  enabled: false
+  collection_name: "fact_cache"
+  similarity_threshold: 0.7
+  max_facts: 10000
+
+# 数据同步配置（阶段 4）
+sync:
+  data_directory: "data/raw"
+  hash_file: "data/.fact_cache_hashes.json"
+  judge_model: "mimo-v2-pro"
+  judge_base_url: "https://token-plan-cn.xiaomimimo.com/v1"
+
 # 自我修正配置
 self_correction:
   enabled: false
   max_retries: 2
   rerank_threshold_good: 0.7
   rerank_threshold_weak: 0.3
-  siliconflow_base_url: "https://api.siliconflow.cn/v1"
-  siliconflow_model: "Qwen/Qwen3-8B"
+  verifier_base_url: "https://token-plan-cn.xiaomimimo.com/v1"
+  verifier_model: "mimo-v2.5-pro"
+
+# 可观测性配置
+langfuse:
+  enabled: false
+  public_key: ""      # 从环境变量 LANGFUSE_PUBLIC_KEY 读取
+  secret_key: ""      # 从环境变量 LANGFUSE_SECRET_KEY 读取
+  host: "https://cloud.langfuse.com"  # 或本地部署地址
+
+# Agent 配置
+agent:
+  enabled: false
+  max_steps: 6
+
+# 知识图谱配置
+graph:
+  enabled: false
+  backend: "networkx"           # "networkx" 或 "neo4j"
+  persist_path: "data/graph_store.pkl"
+  neo4j_uri: "bolt://localhost:7687"
+  neo4j_user: "neo4j"
+  neo4j_password_env: "NEO4J_PASSWORD"
+  max_neighbors: 50
+  max_depth: 2
+
+# MCP Server 配置
+mcp_server:
+  host: "localhost"
+  port: 8080
+  transport: "stdio"   # stdio 或 sse

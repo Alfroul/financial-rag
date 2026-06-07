@@ -22,7 +22,6 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
 
 # 项目根目录加入 sys.path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -31,6 +30,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from src.config import (
     ChunkerConfig,
+    GraphConfig,
     HybridConfig,
     RAGConfig,
     RetrieverConfig,
@@ -38,15 +38,13 @@ from src.config import (
     SelfCorrectionConfig,
 )
 from src.correction.pipeline import SelfCorrectingPipeline
-from src.embeddings.zhipu_embedder import ZhipuEmbedder
 from src.embeddings.siliconflow_embedder import SiliconFlowEmbedder
 from src.evaluation.ragas_eval import RAGEvaluator
-from src.generator.zhipu_llm import ZhipuLLM
+from src.graph.graph_store import create_graph_store
 from src.rag_pipeline import RAGPipeline
 from src.retriever.bm25_retriever import BM25Retriever
 from src.retriever.hybrid_retriever import HybridRetriever
 from src.retriever.retriever import Retriever
-from src.reranker.zhipu_reranker import ZhipuReranker
 from src.reranker.local_reranker import LocalRreranker
 from src.vectorstore.chroma_store import ChromaStore
 
@@ -65,12 +63,12 @@ DEFAULT_COLLECTION = "financial_docs"
 
 
 # ---------------------------------------------------------------------------
-# SiliconFlow LLM（OpenAI 兼容，替代限流的智谱 API）
+# MiMo LLM（OpenAI 兼容，小米大模型平台）
 # ---------------------------------------------------------------------------
 
 
-class SiliconFlowLLM:
-    """轻量 LLM 封装，通过 OpenAI 兼容 API 调用 SiliconFlow 免费模型。
+class MimoLLM:
+    """轻量 LLM 封装，通过 OpenAI 兼容 API 调用 MiMo 模型。
 
     只实现 RAGPipeline.query() 需要的 chat() 方法。
     """
@@ -78,8 +76,8 @@ class SiliconFlowLLM:
     def __init__(
         self,
         api_key: str,
-        model: str = "Qwen/Qwen3-8B",
-        base_url: str = "https://api.siliconflow.cn/v1",
+        model: str = "mimo-v2-pro",
+        base_url: str = "https://token-plan-cn.xiaomimimo.com/v1",
         temperature: float = 0.1,
         max_tokens: int = 2048,
     ) -> None:
@@ -121,10 +119,10 @@ class SiliconFlowLLM:
                 body = resp.json()
                 return body["choices"][0]["message"]["content"] or ""
             except Exception as e:
-                logger.warning("SiliconFlow API 调用失败 (%d/3): %s", attempt + 1, e)
+                logger.warning("MiMo API 调用失败 (%d/3): %s", attempt + 1, e)
                 if attempt < 2:
                     time.sleep(2 ** attempt)
-        raise RuntimeError(f"SiliconFlow API 连续 3 次调用失败: {self._model}")
+        raise RuntimeError(f"MiMo API 连续 3 次调用失败: {self._model}")
 
 
 # ---------------------------------------------------------------------------
@@ -158,49 +156,38 @@ class BenchmarkResult:
 
 
 def _build_pipeline(
-    api_key: str,
+    mimo_api_key: str,
+    embedding_api_key: str,
     strategy: str,
     use_reranker: bool = False,
     use_self_correction: bool = False,
+    use_graph: bool = False,
     persist_dir: str = DEFAULT_PERSIST_DIR,
     collection: str = DEFAULT_COLLECTION,
 ) -> RAGPipeline | SelfCorrectingPipeline:
     """构建指定策略的 RAG Pipeline。
 
     Args:
-        api_key: 智谱 API Key。
+        mimo_api_key: MiMo API Key（小米大模型平台）。
+        embedding_api_key: SiliconFlow API Key（Embedding）。
         strategy: "vector" / "bm25" / "hybrid"。
         use_reranker: 是否启用 Reranker。
         use_self_correction: 是否启用 Self-Correction（用 SelfCorrectingPipeline 包装）。
+        use_graph: 是否启用 GraphRAG。
         persist_dir: ChromaDB 持久化路径。
         collection: ChromaDB 集合名。
     """
-    siliconflow_key = os.environ.get("SILICONFLOW_API_KEY", "")
-    if siliconflow_key:
-        embedder = SiliconFlowEmbedder(
-            api_key=siliconflow_key,
-            model="BAAI/bge-large-zh-v1.5",
-        )
-        llm = SiliconFlowLLM(
-            api_key=siliconflow_key,
-            model="Qwen/Qwen3-8B",
-            temperature=0.1,
-            max_tokens=2048,
-        )
-        logger.info("使用 SiliconFlow（BAAI/bge-large-zh-v1.5 + Qwen3-8B）")
-    else:
-        embedder = ZhipuEmbedder(
-            api_key=api_key,
-            model="embedding-3",
-            batch_size=20,
-        )
-        llm = ZhipuLLM(
-            api_key=api_key,
-            model="glm-4-flash",
-            temperature=0.1,
-            max_tokens=2048,
-        )
-        logger.info("未检测到 SILICONFLOW_API_KEY，使用智谱（embedding-3 + GLM-4-flash）")
+    embedder = SiliconFlowEmbedder(
+        api_key=embedding_api_key,
+        model="BAAI/bge-large-zh-v1.5",
+    )
+    llm = MimoLLM(
+        api_key=mimo_api_key,
+        model="mimo-v2-pro",
+        temperature=0.1,
+        max_tokens=2048,
+    )
+    logger.info("使用 mimo-v2-pro（BAAI/bge-large-zh-v1.5 + MiMo）")
 
     store = ChromaStore(
         persist_directory=persist_dir,
@@ -242,24 +229,6 @@ def _build_pipeline(
             ),
         )
 
-    siliconflow_key = os.environ.get("SILICONFLOW_API_KEY", "")
-    if siliconflow_key:
-        llm = SiliconFlowLLM(
-            api_key=siliconflow_key,
-            model="Qwen/Qwen3-8B",
-            temperature=0.1,
-            max_tokens=2048,
-        )
-        logger.info("使用 SiliconFlow Qwen3-8B 作为生成模型")
-    else:
-        llm = ZhipuLLM(
-            api_key=api_key,
-            model="glm-4-flash",
-            temperature=0.1,
-            max_tokens=2048,
-        )
-        logger.info("未检测到 SILICONFLOW_API_KEY，使用智谱 GLM-4-flash")
-
     reranker = None
     reranker_cfg = None
     if use_reranker:
@@ -283,12 +252,21 @@ def _build_pipeline(
                 ),
             )
 
+    graph_store = None
+    graph_config = None
+    if use_graph:
+        graph_config = GraphConfig(enabled=True)
+        graph_store = create_graph_store(graph_config)
+        logger.info("GraphRAG 已启用（%d nodes, %d edges）", graph_store.stats()["nodes"], graph_store.stats()["edges"])
+
     pipeline = RAGPipeline(
         retriever,
-        cast(ZhipuLLM, llm),
+        llm,
         RAGConfig(max_context_tokens=4000),
         reranker=reranker,
         reranker_config=reranker_cfg,
+        graph_store=graph_store,
+        graph_config=graph_config,
     )
 
     if use_self_correction:
@@ -298,11 +276,10 @@ def _build_pipeline(
             rerank_threshold_good=0.7,
             rerank_threshold_weak=0.3,
         )
-        siliconflow_key = os.environ.get("SILICONFLOW_API_KEY")
         pipeline = SelfCorrectingPipeline(
             pipeline=pipeline,
             config=sc_config,
-            api_key=siliconflow_key,
+            api_key=mimo_api_key,
         )
 
     return pipeline
@@ -336,35 +313,36 @@ def _run_with_latency(
 
 
 def _run_eval_config(
-    api_key: str,
+    mimo_api_key: str,
+    embedding_api_key: str,
     eval_samples: list[dict],
     strategy: str,
     use_reranker: bool = False,
     use_self_correction: bool = False,
+    use_graph: bool = False,
     label: str = "",
 ) -> BenchmarkResult:
     """对单种配置运行完整评测。"""
     if not label:
         reranker_tag = " + Reranker" if use_reranker else ""
         sc_tag = " + SelfCorrection" if use_self_correction else ""
-        label = f"{strategy}{reranker_tag}{sc_tag}"
+        graph_tag = " + Graph" if use_graph else ""
+        label = f"{strategy}{reranker_tag}{sc_tag}{graph_tag}"
 
     logger.info("=" * 60)
     logger.info("开始评测: %s", label)
     logger.info("=" * 60)
 
-    pipeline = _build_pipeline(api_key, strategy=strategy, use_reranker=use_reranker, use_self_correction=use_self_correction)
+    pipeline = _build_pipeline(mimo_api_key, embedding_api_key, strategy=strategy, use_reranker=use_reranker, use_self_correction=use_self_correction, use_graph=use_graph)
 
-    siliconflow_key = os.environ.get("SILICONFLOW_API_KEY", "")
-    if siliconflow_key:
-        evaluator = RAGEvaluator(
-            api_key=siliconflow_key,
-            model="Qwen/Qwen3-8B",
-            embedding_model="BAAI/bge-large-zh-v1.5",
-            base_url="https://api.siliconflow.cn/v1",
-        )
-    else:
-        evaluator = RAGEvaluator(api_key=api_key, model="glm-4-flash")
+    evaluator = RAGEvaluator(
+        api_key=mimo_api_key,
+        model="mimo-v2-pro",
+        embedding_model="BAAI/bge-large-zh-v1.5",
+        base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        embedding_api_key=embedding_api_key,
+        embedding_base_url="https://api.siliconflow.cn/v1",
+    )
 
     responses: list[str] = []
     all_contexts: list[list[str]] = []
@@ -492,6 +470,8 @@ def _write_conclusions(results: list[BenchmarkResult], lines: list[str]) -> None
             key += "+reranker"
         if "selfcorrection" in r.label.lower() or "self-correction" in r.label.lower():
             key += "+selfcorrection"
+        if "graph" in r.label.lower() and "selfcorrection" not in r.label.lower():
+            key += "+graph"
         by_strategy[key] = r
 
     # 1. 混合 vs 纯向量
@@ -535,6 +515,20 @@ def _write_conclusions(results: list[BenchmarkResult], lines: list[str]) -> None
                 lines.append(
                     f"- **Self-Correction 效果** — {display}（{metric}）：{direction} {abs(diff_pct):.1f}%"
                     f"（{h:.4f} \u2192 {s:.4f}）"
+                )
+
+    # 2.6 GraphRAG 效果
+    graph_r = by_strategy.get("hybrid+graph")
+    if hybrid_r and graph_r:
+        for metric, display in _METRIC_DISPLAY.items():
+            h = hybrid_r.ragas_scores.get(metric, 0)
+            g = graph_r.ragas_scores.get(metric, 0)
+            if h > 0 and g > 0:
+                diff_pct = (g - h) / h * 100
+                direction = "提升" if diff_pct > 0 else "下降"
+                lines.append(
+                    f"- **GraphRAG 效果** — {display}（{metric}）：{direction} {abs(diff_pct):.1f}%"
+                    f"（{h:.4f} → {g:.4f}）"
                 )
 
     # 3. 延迟结论
@@ -600,12 +594,13 @@ def _load_eval_samples(path: Path) -> list[dict]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Financial RAG Benchmark")
-    parser.add_argument("--api-key", type=str, default=None, help="智谱 API Key（也可通过 .env 配置）")
+    parser.add_argument("--api-key", type=str, default=None, help="SiliconFlow API Key（也可通过 .env 配置）")
     parser.add_argument("--eval-path", type=str, default=None, help="评估数据集路径")
     parser.add_argument("--skip-reranker", action="store_true", help="跳过 Reranker 对比")
     parser.add_argument("--skip-chunk-sizes", action="store_true", help="跳过 chunk_size 对比")
     parser.add_argument("--v8", action="store_true", help="启用 Self-Correction 对比（v8 版本）")
     parser.add_argument("--skip-baselines", action="store_true", help="跳过 vector/bm25/hybrid 基线配置")
+    parser.add_argument("--graph", action="store_true", help="启用 GraphRAG 对比（hybrid + graph）")
     parser.add_argument("--output", type=str, default=None, help="输出 Markdown 文件路径")
     args = parser.parse_args()
 
@@ -616,14 +611,17 @@ def main() -> None:
     except ImportError:
         pass
 
-    api_key = args.api_key
-    if not api_key:
-        import os
-        api_key = os.environ.get("ZHIPU_API_KEY", "")
-
-    siliconflow_key = os.environ.get("SILICONFLOW_API_KEY", "")
-    if not api_key and not siliconflow_key:
-        logger.error("未提供 API Key。请通过 --api-key 参数或 .env 配置 SILICONFLOW_API_KEY 或 ZHIPU_API_KEY。")
+    mimo_api_key = os.environ.get("MIMO_API_KEY", "")
+    embedding_api_key = os.environ.get("SILICONFLOW_API_KEY", "")
+    api_key_override = args.api_key
+    if api_key_override:
+        mimo_api_key = api_key_override
+        embedding_api_key = api_key_override
+    if not mimo_api_key:
+        logger.error("未提供 MIMO_API_KEY。请在 .env 中配置。")
+        sys.exit(1)
+    if not embedding_api_key:
+        logger.error("未提供 SILICONFLOW_API_KEY。请在 .env 中配置。")
         sys.exit(1)
 
     # 2. 加载评估数据集
@@ -631,32 +629,38 @@ def main() -> None:
     eval_samples = _load_eval_samples(eval_path)
 
     # 3. 定义评测配置
-    configs: list[tuple[str, str, bool, bool]] = []
+    configs: list[tuple[str, str, bool, bool, bool]] = []
     if not args.skip_baselines:
         configs.extend([
-            ("vector", "vector", False, False),
-            ("bm25", "bm25", False, False),
-            ("hybrid", "hybrid", False, False),
+            ("vector", "vector", False, False, False),
+            ("bm25", "bm25", False, False, False),
+            ("hybrid", "hybrid", False, False, False),
         ])
         if not args.skip_reranker:
-            configs.append(("hybrid + Reranker", "hybrid", True, False))
+            configs.append(("hybrid + Reranker", "hybrid", True, False, False))
     if args.v8:
-        if not any(c[1] == "hybrid" and not c[2] and not c[3] for c in configs):
-            configs.append(("hybrid", "hybrid", False, False))
-        configs.append(("hybrid + SelfCorrection", "hybrid", False, True))
+        if not any(c[1] == "hybrid" and not c[2] and not c[3] and not c[4] for c in configs):
+            configs.append(("hybrid", "hybrid", False, False, False))
+        configs.append(("hybrid + SelfCorrection", "hybrid", False, True, False))
         if not args.skip_reranker:
-            configs.append(("hybrid + Reranker + SelfCorrection", "hybrid", True, True))
+            configs.append(("hybrid + Reranker + SelfCorrection", "hybrid", True, True, False))
+    if args.graph:
+        if not any(c[1] == "hybrid" and not c[2] and not c[3] and not c[4] for c in configs):
+            configs.append(("hybrid", "hybrid", False, False, False))
+        configs.append(("hybrid + Graph", "hybrid", False, False, True))
 
     # 4. 逐个配置运行评测
     results: list[BenchmarkResult] = []
-    for label, strategy, use_reranker, use_self_correction in configs:
+    for label, strategy, use_reranker, use_self_correction, use_graph in configs:
         try:
             result = _run_eval_config(
-                api_key=api_key,
+                mimo_api_key=mimo_api_key,
+                embedding_api_key=embedding_api_key,
                 eval_samples=eval_samples,
                 strategy=strategy,
                 use_reranker=use_reranker,
                 use_self_correction=use_self_correction,
+                use_graph=use_graph,
                 label=label,
             )
             results.append(result)

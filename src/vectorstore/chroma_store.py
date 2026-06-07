@@ -126,7 +126,7 @@ class ChromaStore:
     def get_documents_by_ids(self, ids: list[str]) -> dict[str, dict]:
         """批量获取文档内容（供 BM25 等模块使用）。"""
         try:
-            result: dict = self._collection.get(ids=ids, include=["documents", "metadatas"])
+            result = self._collection.get(ids=ids, include=["documents", "metadatas"])  # type: ignore[assignment]
             doc_map: dict[str, dict] = {}
             docs: list = result.get("documents") or []
             metas: list = result.get("metadatas") or [{}] * len(docs)
@@ -184,7 +184,7 @@ class ChromaStore:
     def get_all_ids(self) -> list[str]:
         """获取所有已存储的文档 ID。"""
         try:
-            result: dict = self._collection.get(include=[])
+            result = self._collection.get(include=[])  # type: ignore[assignment]
             ids: list = result.get("ids", [])
             return [str(i) for i in ids]
         except Exception as e:

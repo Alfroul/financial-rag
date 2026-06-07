@@ -11,7 +11,9 @@ from dotenv import load_dotenv
 
 @dataclass(frozen=True)
 class LLMConfig:
-    model: str = "Qwen/Qwen3-8B"
+    model: str = "mimo-v2-pro"
+    base_url: str = "https://token-plan-cn.xiaomimimo.com/v1"
+    api_key_env: str = "MIMO_API_KEY"
     temperature: float = 0.7
     max_tokens: int = 2048
     top_p: float = 0.9
@@ -110,13 +112,69 @@ class CacheConfig:
 
 
 @dataclass(frozen=True)
+class FactCacheConfig:
+    enabled: bool = False
+    collection_name: str = "fact_cache"
+    similarity_threshold: float = 0.7
+    max_facts: int = 10000
+
+    def __post_init__(self):
+        if not 0 <= self.similarity_threshold <= 1:
+            raise ValueError(f"similarity_threshold must be 0-1, got {self.similarity_threshold}")
+        if self.max_facts < 1:
+            raise ValueError(f"max_facts must be positive, got {self.max_facts}")
+
+
+@dataclass(frozen=True)
+class SyncConfig:
+    data_directory: str = "data/raw"
+    hash_file: str = "data/.fact_cache_hashes.json"
+    judge_model: str = "mimo-v2-pro"
+    judge_base_url: str = "https://api.xiaomimimo.com"
+
+
+@dataclass(frozen=True)
 class SelfCorrectionConfig:
     enabled: bool = False
     max_retries: int = 2
     rerank_threshold_good: float = 0.7
     rerank_threshold_weak: float = 0.3
-    siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
-    siliconflow_model: str = "Qwen/Qwen3-8B"
+    verifier_base_url: str = "https://token-plan-cn.xiaomimimo.com/v1"
+    verifier_model: str = "mimo-v2.5-pro"
+
+
+@dataclass(frozen=True)
+class LangfuseConfig:
+    enabled: bool = False
+    public_key: str = ""
+    secret_key: str = ""
+    host: str = "https://cloud.langfuse.com"
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    enabled: bool = False
+    max_steps: int = 6
+    model: str = ""  # 空=使用默认 LLM
+
+
+@dataclass(frozen=True)
+class GraphConfig:
+    enabled: bool = False
+    backend: str = "networkx"
+    persist_path: str = "data/graph_store.pkl"
+    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_password_env: str = "NEO4J_PASSWORD"
+    max_neighbors: int = 50
+    max_depth: int = 2
+
+
+@dataclass(frozen=True)
+class MCPServerConfig:
+    host: str = "localhost"
+    port: int = 8080
+    transport: str = "stdio"
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -147,7 +205,13 @@ class Config:
     _hybrid: HybridConfig
     _reranker: RerankerConfig
     _cache: CacheConfig
+    _fact_cache: FactCacheConfig
+    _sync: SyncConfig
     _self_correction: SelfCorrectionConfig
+    _agent: AgentConfig
+    _langfuse: LangfuseConfig
+    _graph: GraphConfig
+    _mcp_server: MCPServerConfig
     _app: AppConfig
 
     def __init__(self) -> None:
@@ -173,7 +237,13 @@ class Config:
             if isinstance(tmp, dict):
                 cache_raw = tmp
         self._cache = self._make(CacheConfig, cache_raw)
+        self._fact_cache = self._make(FactCacheConfig, cast(dict[str, Any], raw.get("fact_cache") or {}))
+        self._sync = self._make(SyncConfig, cast(dict[str, Any], raw.get("sync") or {}))
         self._self_correction = self._make(SelfCorrectionConfig, cast(dict[str, Any], raw.get("self_correction") or {}))
+        self._agent = self._make(AgentConfig, cast(dict[str, Any], raw.get("agent") or {}))
+        self._langfuse = self._make(LangfuseConfig, cast(dict[str, Any], raw.get("langfuse") or {}))
+        self._graph = self._make(GraphConfig, cast(dict[str, Any], raw.get("graph") or {}))
+        self._mcp_server = self._make(MCPServerConfig, cast(dict[str, Any], raw.get("mcp_server") or {}))
         # Safe retrieval of logging level from YAML
         log_level = "INFO"
         if isinstance(raw, dict):
@@ -225,16 +295,44 @@ class Config:
 
     @property
     def api_key(self) -> str | None:
-        return os.environ.get("SILICONFLOW_API_KEY")
+        return os.environ.get("MIMO_API_KEY") or os.environ.get("SILICONFLOW_API_KEY")
 
     @property
     def cache(self) -> CacheConfig:
         return self._cache
 
     @property
+    def fact_cache(self) -> FactCacheConfig:
+        return self._fact_cache
+
+    @property
+    def sync(self) -> SyncConfig:
+        return self._sync
+
+    @property
     def self_correction(self) -> SelfCorrectionConfig:
         return self._self_correction
 
     @property
+    def agent(self) -> AgentConfig:
+        return self._agent
+
+    @property
+    def langfuse(self) -> LangfuseConfig:
+        return self._langfuse
+
+    @property
+    def graph(self) -> GraphConfig:
+        return self._graph
+
+    @property
+    def mcp_server(self) -> MCPServerConfig:
+        return self._mcp_server
+
+    @property
     def siliconflow_api_key(self) -> str | None:
         return os.environ.get("SILICONFLOW_API_KEY")
+
+    @property
+    def mimo_api_key(self) -> str | None:
+        return os.environ.get("MIMO_API_KEY")

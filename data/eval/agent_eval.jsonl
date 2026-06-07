@@ -1,0 +1,20 @@
+{"task": "对比茅台和五粮液的ROE趋势，哪个更值得投资？需要检索两家公司的ROE数据并进行比较。", "expected_tools": ["financial_search", "calculator"], "expected_steps": 3, "evaluation_criteria": ["包含茅台和五粮液的ROE数据", "有数值对比计算", "给出投资倾向性建议"]}
+{"task": "对比招商银行和工商银行的不良贷款率，哪家银行的资产质量更好？", "expected_tools": ["financial_search", "calculator"], "expected_steps": 3, "evaluation_criteria": ["包含两家银行不良贷款率数据", "有对比分析", "给出资产质量评价"]}
+{"task": "比较沪深300和中证500的市盈率，哪个指数当前估值更低？", "expected_tools": ["financial_search", "calculator"], "expected_steps": 3, "evaluation_criteria": ["包含两个指数的PE数据", "有数值比较", "给出估值判断"]}
+{"task": "对比贵州茅台和海天味业的毛利率，哪家公司的盈利能力更强？", "expected_tools": ["financial_search", "calculator"], "expected_steps": 3, "evaluation_criteria": ["包含两家公司毛利率数据", "有盈利能力对比分析", "给出结论"]}
+{"task": "比较宁德时代和比亚迪的营收增速，哪家公司增长更快？", "expected_tools": ["financial_search", "calculator"], "expected_steps": 3, "evaluation_criteria": ["包含两家公司营收及增速数据", "有增速对比计算", "给出增长性判断"]}
+{"task": "2024年白酒行业整体下滑的原因是什么？请检索相关信息并分析主要因素。", "expected_tools": ["financial_search", "knowledge_graph"], "expected_steps": 2, "evaluation_criteria": ["列出白酒行业下滑的具体表现", "分析至少2个主要原因", "有数据支撑"]}
+{"task": "贵州茅台2024年营收增速放缓的原因可能是什么？请从行业和公司层面分析。", "expected_tools": ["financial_search", "knowledge_graph"], "expected_steps": 3, "evaluation_criteria": ["包含茅台营收增速数据", "从行业环境和公司层面分析原因", "分析有逻辑性"]}
+{"task": "央行降息对银行股盈利能力的影响是什么？请分析传导机制。", "expected_tools": ["financial_search", "calculator"], "expected_steps": 3, "evaluation_criteria": ["解释降息对银行净息差的影响", "有具体数据或计算", "分析传导链条完整"]}
+{"task": "房地产行业下行对建材、家电等上下游行业产生了哪些影响？", "expected_tools": ["financial_search", "knowledge_graph"], "expected_steps": 3, "evaluation_criteria": ["列出受影响的上下游行业", "分析具体影响方向和程度", "有行业数据支撑"]}
+{"task": "新能源汽车渗透率持续提升的原因是什么？从政策、技术、消费三个维度分析。", "expected_tools": ["financial_search", "knowledge_graph"], "expected_steps": 3, "evaluation_criteria": ["包含渗透率数据", "从政策、技术、消费三个维度分析", "每个维度有具体论据"]}
+{"task": "贵州茅台2024年的净利润率是多少？请检索营收和净利润数据并计算。", "expected_tools": ["financial_search", "calculator"], "expected_steps": 3, "evaluation_criteria": ["包含茅台营收和净利润数据", "有净利润率计算过程", "计算结果正确"]}
+{"task": "A股当前的整体市盈率是多少？和历史平均水平相比处于什么位置？", "expected_tools": ["financial_search", "calculator"], "expected_steps": 3, "evaluation_criteria": ["包含A股当前PE数据", "有历史平均PE对比", "给出估值水平判断"]}
+{"task": "计算贵州茅台近3年的营收复合增长率（CAGR）。", "expected_tools": ["financial_search", "calculator"], "expected_steps": 3, "evaluation_criteria": ["包含3年营收数据", "CAGR计算公式正确", "计算结果合理"]}
+{"task": "工商银行的股息率是多少？和一年期定期存款利率相比如何？", "expected_tools": ["financial_search", "calculator"], "expected_steps": 3, "evaluation_criteria": ["包含工行股息率数据", "包含存款利率数据", "有收益率对比分析"]}
+{"task": "沪深300指数当前的市净率是多少？和近5年平均值相比是否偏高？", "expected_tools": ["financial_search", "calculator"], "expected_steps": 3, "evaluation_criteria": ["包含当前PB数据", "有历史PB对比", "给出是否偏高的判断"]}
+{"task": "帮我分析当前买入贵州茅台的风险和收益，从估值、业绩、行业竞争三个角度给出分析。", "expected_tools": ["financial_search", "calculator", "knowledge_graph"], "expected_steps": 4, "evaluation_criteria": ["包含茅台估值数据", "分析业绩增长情况", "分析行业竞争格局", "综合给出风险收益判断"]}
+{"task": "分析白酒行业的投资价值，需要考虑行业增速、竞争格局、估值水平三个维度。", "expected_tools": ["financial_search", "calculator", "knowledge_graph"], "expected_steps": 4, "evaluation_criteria": ["包含行业增速数据", "分析竞争格局", "有估值水平评估", "综合三个维度给出投资建议"]}
+{"task": "分析银行股的投资价值，重点关注股息率、不良贷款率、净息差三个指标。", "expected_tools": ["financial_search", "calculator", "knowledge_graph"], "expected_steps": 4, "evaluation_criteria": ["包含股息率数据", "包含不良贷款率数据", "包含净息差数据", "综合分析银行股投资价值"]}
+{"task": "评估新能源板块当前是否值得投资，需要从估值、政策支持、行业增速三个方面分析。", "expected_tools": ["financial_search", "calculator", "knowledge_graph"], "expected_steps": 4, "evaluation_criteria": ["包含新能源板块估值数据", "分析政策支持力度", "有行业增速数据", "给出综合投资建议"]}
+{"task": "对比消费和科技两大板块的投资前景，分析各自的优劣势。", "expected_tools": ["financial_search", "calculator", "knowledge_graph"], "expected_steps": 4, "evaluation_criteria": ["包含两个板块的关键数据", "分析各自优势和风险", "有估值对比", "给出配置建议"]}

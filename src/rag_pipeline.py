@@ -8,17 +8,27 @@ from string import Template
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
+from src.agent.base_tool import BaseTool
+from src.agent.react import ReActAgent
+from src.agent.tools.calculator import CalculatorTool
+from src.agent.tools.financial_search import FinancialSearchTool
 from src.cache import QueryCache
+from src.fact_cache.store import FactCacheStore
+from src.fact_extractor.extractor import FactExtractor
+from src.graph.graph_retriever import GraphRetriever
+from src.graph.graph_store import GraphStore
+from src.graph.triple import Triple
 from src.metrics.collector import MetricsCollector, QueryMetrics
+from src.observability.langfuse_tracer import LangfuseTracer
 from src.retriever.hybrid_retriever import HybridRetriever
 from src.retriever.retriever import RetrievalResult, Retriever
 
 if TYPE_CHECKING:
     import tiktoken
 
-    from src.config import RAGConfig, RerankerConfig
+    from src.config import GraphConfig, RAGConfig, RerankerConfig
+    from src.generator.mimo_llm import MimoLLM
     from src.generator.query_rewriter import QueryRewriter
-    from src.generator.siliconflow_llm import SiliconFlowLLM
     from src.reranker.local_reranker import LocalRreranker
 
 RetrieverType: TypeAlias = Retriever | HybridRetriever
@@ -68,12 +78,19 @@ class RAGPipeline:
     def __init__(
         self,
         retriever: Retriever | HybridRetriever,
-        llm: SiliconFlowLLM,
+        llm: MimoLLM,
         config: RAGConfig,
         reranker: LocalRreranker | None = None,
         reranker_config: RerankerConfig | None = None,
         query_rewriter: QueryRewriter | None = None,
         cache: QueryCache | None = None,
+        fact_cache: FactCacheStore | None = None,
+        fact_extractor: FactExtractor | None = None,
+        fact_cache_threshold: float = 0.7,
+        graph_store: GraphStore | None = None,
+        graph_config: GraphConfig | None = None,
+        graph_retriever: GraphRetriever | None = None,
+        tracer: LangfuseTracer | None = None,
     ) -> None:
         self._retriever = retriever
         self._llm = llm
@@ -82,6 +99,13 @@ class RAGPipeline:
         self._reranker_config = reranker_config
         self._query_rewriter = query_rewriter
         self._cache = cache
+        self._fact_cache = fact_cache
+        self._fact_extractor = fact_extractor
+        self._fact_cache_threshold = fact_cache_threshold
+        self._graph_store = graph_store
+        self._graph_config = graph_config
+        self._graph_retriever = graph_retriever
+        self._tracer = tracer
 
     def query(
         self,
@@ -97,6 +121,11 @@ class RAGPipeline:
 
         collector = MetricsCollector()
         from_cache = False
+        tracer = self._tracer
+        trace_id: str | None = None
+
+        if tracer is not None and tracer.enabled:
+            trace_id = tracer.start_trace(question)
 
         if self._cache is not None:
             cached = self._run_async(self._cache.get(question))
@@ -109,33 +138,99 @@ class RAGPipeline:
                         cache_hit=True,
                     )
                 )
+                if tracer is not None and trace_id is not None:
+                    tracer.end_trace(trace_id, output="cache_hit")
                 return cast(dict[str, Any], cached)
 
         if chat_history and self._query_rewriter:
             question = self._query_rewriter.rewrite(question, chat_history)
 
+        # 知识缓存层集成点 — 在检索前查询FactCache，命中则跳过RAG检索
+        fact_cache_result = self._try_fact_cache(question, chat_history, collector)
+        if fact_cache_result is not None:
+            if tracer is not None and trace_id is not None:
+                tracer.end_trace(trace_id, output="fact_cache_hit")
+            return fact_cache_result
+
+        graph_triples = self._try_graph_query(question)
+
+        # --- retrieval span ---
+        retrieval_span: str | None = None
+        if tracer is not None and trace_id is not None:
+            retrieval_span = tracer.start_span(trace_id, "retrieval", {"query": question})
         t_retrieve = perf_counter()
         results = self._retrieve_or_fallback(question, **retrieve_kwargs)
         retrieve_ms = (perf_counter() - t_retrieve) * 1000
-        if results is None:
-            collector.record(
-                QueryMetrics(
-                    question=question[:50],
-                    retrieve_ms=retrieve_ms,
-                    total_ms=retrieve_ms,
-                    num_sources=0,
-                )
+        if retrieval_span is not None and tracer is not None:
+            tracer.end_span(
+                retrieval_span,
+                output_data={
+                    "num_results": len(results) if results else 0,
+                    "ms": round(retrieve_ms, 2),
+                },
             )
-            return {"answer": "抱歉，在知识库中未找到与您问题相关的信息。", "sources": []}
 
-        rerank_ms = 0.0
-        if self._reranker and results:
-            t_rerank = perf_counter()
-            results = self._rerank_results(question, results)
-            rerank_ms = (perf_counter() - t_rerank) * 1000
+        if graph_triples:
+            if results is None:
+                results = []
+            rag_context = ""
+            sources: list[dict] = []
+            if results:
+                if self._reranker:
+                    rerank_span = (
+                        tracer.start_span(trace_id, "rerank")
+                        if tracer is not None and trace_id is not None
+                        else None
+                    )
+                    t_rerank = perf_counter()
+                    results = self._rerank_results(question, results)
+                    rerank_ms = (perf_counter() - t_rerank) * 1000
+                    if rerank_span and tracer is not None:
+                        tracer.end_span(
+                            rerank_span,
+                            output_data={
+                                "ms": round(rerank_ms, 2),
+                                "num_results": len(results),
+                            },
+                        )
+                formatted_context, sources = self._format_context(results)
+                rag_context, sources = self._trim_context(formatted_context, self._max_context_tokens, sources)
+            trimmed_context = self._build_graph_prompt(graph_triples, rag_context)
+        else:
+            if results is None:
+                collector.record(
+                    QueryMetrics(
+                        question=question[:50],
+                        retrieve_ms=retrieve_ms,
+                        total_ms=retrieve_ms,
+                        num_sources=0,
+                    )
+                )
+                if tracer is not None and trace_id is not None:
+                    tracer.end_trace(trace_id, output="no_results")
+                return {"answer": "抱歉，在知识库中未找到与您问题相关的信息。", "sources": []}
 
-        formatted_context, sources = self._format_context(results)
-        trimmed_context, sources = self._trim_context(formatted_context, self._max_context_tokens, sources)
+            rerank_ms = 0.0
+            if self._reranker and results:
+                rerank_span = (
+                    tracer.start_span(trace_id, "rerank")
+                    if tracer is not None and trace_id is not None
+                    else None
+                )
+                t_rerank = perf_counter()
+                results = self._rerank_results(question, results)
+                rerank_ms = (perf_counter() - t_rerank) * 1000
+                if rerank_span and tracer is not None:
+                    tracer.end_span(
+                        rerank_span,
+                        output_data={
+                            "ms": round(rerank_ms, 2),
+                            "num_results": len(results),
+                        },
+                    )
+
+            formatted_context, sources = self._format_context(results)
+            trimmed_context, sources = self._trim_context(formatted_context, self._max_context_tokens, sources)
 
         system_prompt = Template(_SYSTEM_PROMPT_TEMPLATE).safe_substitute(
             retrieved_documents=trimmed_context,
@@ -148,12 +243,22 @@ class RAGPipeline:
             max_history_tokens=max(200, self._max_context_tokens * 2 // 5),
         )
 
+        # --- generation span ---
+        gen_span: str | None = None
+        if tracer is not None and trace_id is not None:
+            gen_span = tracer.start_span(trace_id, "generation")
         t_generate = perf_counter()
         try:
             answer = self._llm.chat(system_prompt, messages)
         except Exception as e:
+            if gen_span is not None and tracer is not None:
+                tracer.end_span(gen_span, output_data={"error": str(e)})
+            if tracer is not None and trace_id is not None:
+                tracer.end_trace(trace_id, output="generation_error")
             raise RAGPipelineError(f"LLM 生成失败: {e}") from e
         generate_ms = (perf_counter() - t_generate) * 1000
+        if gen_span is not None and tracer is not None:
+            tracer.end_span(gen_span, output_data={"ms": round(generate_ms, 2), "answer_len": len(answer)})
 
         total_ms = retrieve_ms + rerank_ms + generate_ms
         collector.record(
@@ -171,8 +276,14 @@ class RAGPipeline:
         )
 
         result = {"answer": answer, "sources": sources}
+
+        self._extract_and_cache_facts(sources, question)
+
         if self._cache is not None:
             self._run_async(self._cache.put(question, result))
+
+        if tracer is not None and trace_id is not None:
+            tracer.end_trace(trace_id, output={"answer_len": len(answer), "num_sources": len(sources)})
         return result
 
     def stream_query(
@@ -205,16 +316,29 @@ class RAGPipeline:
         if chat_history and self._query_rewriter:
             question = self._query_rewriter.rewrite(question, chat_history)
 
+        graph_triples = self._try_graph_query(question)
+
         results = self._retrieve_or_fallback(question, **retrieve_kwargs)
-        if results is None:
-            yield {"type": "answer", "content": "抱歉，在知识库中未找到与您问题相关的信息。"}
-            return
 
-        if self._reranker and results:
-            results = self._rerank_results(question, results)
-
-        formatted_context, sources = self._format_context(results)
-        trimmed_context, sources = self._trim_context(formatted_context, self._max_context_tokens, sources)
+        if graph_triples:
+            if results is None:
+                results = []
+            rag_context = ""
+            sources: list[dict] = []
+            if results:
+                if self._reranker:
+                    results = self._rerank_results(question, results)
+                formatted_context, sources = self._format_context(results)
+                rag_context, sources = self._trim_context(formatted_context, self._max_context_tokens, sources)
+            trimmed_context = self._build_graph_prompt(graph_triples, rag_context)
+        else:
+            if results is None:
+                yield {"type": "answer", "content": "抱歉，在知识库中未找到与您问题相关的信息。"}
+                return
+            if self._reranker and results:
+                results = self._rerank_results(question, results)
+            formatted_context, sources = self._format_context(results)
+            trimmed_context, sources = self._trim_context(formatted_context, self._max_context_tokens, sources)
 
         yield {"type": "sources", "sources": sources}
 
@@ -253,6 +377,11 @@ class RAGPipeline:
 
         collector = MetricsCollector()
         from_cache = False
+        tracer = self._tracer
+        trace_id: str | None = None
+
+        if tracer is not None and tracer.enabled:
+            trace_id = tracer.start_trace(question)
 
         # 1) 通过语义缓存快速命中（阶段 2，若启用）
         if self._cache is not None:
@@ -266,33 +395,99 @@ class RAGPipeline:
                         cache_hit=True,
                     )
                 )
+                if tracer is not None and trace_id is not None:
+                    tracer.end_trace(trace_id, output="cache_hit")
                 return cast(dict[str, Any], cached)
 
         if chat_history and self._query_rewriter:
             question = await self._query_rewriter.arewrite(question, chat_history)
 
+        # 知识缓存层集成点 — 在检索前查询FactCache，命中则跳过RAG检索
+        fact_cache_result = await self._atry_fact_cache(question, chat_history, collector)
+        if fact_cache_result is not None:
+            if tracer is not None and trace_id is not None:
+                tracer.end_trace(trace_id, output="fact_cache_hit")
+            return fact_cache_result
+
+        graph_triples = self._try_graph_query(question)
+
+        # --- retrieval span ---
+        retrieval_span: str | None = None
+        if tracer is not None and trace_id is not None:
+            retrieval_span = tracer.start_span(trace_id, "retrieval", {"query": question})
         t_retrieve = perf_counter()
         results = await self._aretrieve_or_fallback(question, **retrieve_kwargs)
         retrieve_ms = (perf_counter() - t_retrieve) * 1000
-        if results is None:
-            collector.record(
-                QueryMetrics(
-                    question=question[:50],
-                    retrieve_ms=round(retrieve_ms, 2),
-                    total_ms=round(retrieve_ms, 2),
-                    num_sources=0,
-                )
+        if retrieval_span is not None and tracer is not None:
+            tracer.end_span(
+                retrieval_span,
+                output_data={
+                    "num_results": len(results) if results else 0,
+                    "ms": round(retrieve_ms, 2),
+                },
             )
-            return {"answer": "抱歉，在知识库中未找到与您问题相关的信息。", "sources": []}
 
-        rerank_ms = 0.0
-        if self._reranker and results:
-            t_rerank = perf_counter()
-            results = await self._arerank_results(question, results)
-            rerank_ms = (perf_counter() - t_rerank) * 1000
+        if graph_triples:
+            if results is None:
+                results = []
+            rag_context = ""
+            sources: list[dict] = []
+            if results:
+                if self._reranker:
+                    rerank_span = (
+                        tracer.start_span(trace_id, "rerank")
+                        if tracer is not None and trace_id is not None
+                        else None
+                    )
+                    t_rerank = perf_counter()
+                    results = await self._arerank_results(question, results)
+                    rerank_ms = (perf_counter() - t_rerank) * 1000
+                    if rerank_span and tracer is not None:
+                        tracer.end_span(
+                            rerank_span,
+                            output_data={
+                                "ms": round(rerank_ms, 2),
+                                "num_results": len(results),
+                            },
+                        )
+                formatted_context, sources = self._format_context(results)
+                rag_context, sources = self._trim_context(formatted_context, self._max_context_tokens, sources)
+            trimmed_context = self._build_graph_prompt(graph_triples, rag_context)
+        else:
+            if results is None:
+                collector.record(
+                    QueryMetrics(
+                        question=question[:50],
+                        retrieve_ms=round(retrieve_ms, 2),
+                        total_ms=round(retrieve_ms, 2),
+                        num_sources=0,
+                    )
+                )
+                if tracer is not None and trace_id is not None:
+                    tracer.end_trace(trace_id, output="no_results")
+                return {"answer": "抱歉，在知识库中未找到与您问题相关的信息。", "sources": []}
 
-        formatted_context, sources = self._format_context(results)
-        trimmed_context, sources = self._trim_context(formatted_context, self._max_context_tokens, sources)
+            rerank_ms = 0.0
+            if self._reranker and results:
+                rerank_span = (
+                    tracer.start_span(trace_id, "rerank")
+                    if tracer is not None and trace_id is not None
+                    else None
+                )
+                t_rerank = perf_counter()
+                results = await self._arerank_results(question, results)
+                rerank_ms = (perf_counter() - t_rerank) * 1000
+                if rerank_span and tracer is not None:
+                    tracer.end_span(
+                        rerank_span,
+                        output_data={
+                            "ms": round(rerank_ms, 2),
+                            "num_results": len(results),
+                        },
+                    )
+
+            formatted_context, sources = self._format_context(results)
+            trimmed_context, sources = self._trim_context(formatted_context, self._max_context_tokens, sources)
 
         system_prompt = Template(_SYSTEM_PROMPT_TEMPLATE).safe_substitute(
             retrieved_documents=trimmed_context,
@@ -305,12 +500,22 @@ class RAGPipeline:
             max_history_tokens=max(200, self._max_context_tokens * 2 // 5),
         )
 
+        # --- generation span ---
+        gen_span: str | None = None
+        if tracer is not None and trace_id is not None:
+            gen_span = tracer.start_span(trace_id, "generation")
         t_generate = perf_counter()
         try:
             answer = await self._llm.achat(system_prompt, messages)
         except Exception as e:
+            if gen_span is not None and tracer is not None:
+                tracer.end_span(gen_span, output_data={"error": str(e)})
+            if tracer is not None and trace_id is not None:
+                tracer.end_trace(trace_id, output="generation_error")
             raise RAGPipelineError(f"LLM 异步生成失败: {e}") from e
         generate_ms = (perf_counter() - t_generate) * 1000
+        if gen_span is not None and tracer is not None:
+            tracer.end_span(gen_span, output_data={"ms": round(generate_ms, 2), "answer_len": len(answer)})
 
         total_ms = retrieve_ms + rerank_ms + generate_ms
         collector.record(
@@ -330,6 +535,11 @@ class RAGPipeline:
         # 2) 缓存写入
         if self._cache is not None:
             await self._cache.put(question, {"answer": answer, "sources": sources})
+
+        await asyncio.to_thread(self._extract_and_cache_facts, sources, question)
+
+        if tracer is not None and trace_id is not None:
+            tracer.end_trace(trace_id, output={"answer_len": len(answer), "num_sources": len(sources)})
         return {"answer": answer, "sources": sources}
 
     async def astream_query(
@@ -349,16 +559,29 @@ class RAGPipeline:
         if chat_history and self._query_rewriter:
             question = await self._query_rewriter.arewrite(question, chat_history)
 
+        graph_triples = self._try_graph_query(question)
+
         results = await self._aretrieve_or_fallback(question, **retrieve_kwargs)
-        if results is None:
-            yield {"type": "answer", "content": "抱歉，在知识库中未找到与您问题相关的信息。"}
-            return
 
-        if self._reranker and results:
-            results = await self._arerank_results(question, results)
-
-        formatted_context, sources = self._format_context(results)
-        trimmed_context, sources = self._trim_context(formatted_context, self._max_context_tokens, sources)
+        if graph_triples:
+            if results is None:
+                results = []
+            rag_context = ""
+            sources: list[dict] = []
+            if results:
+                if self._reranker:
+                    results = await self._arerank_results(question, results)
+                formatted_context, sources = self._format_context(results)
+                rag_context, sources = self._trim_context(formatted_context, self._max_context_tokens, sources)
+            trimmed_context = self._build_graph_prompt(graph_triples, rag_context)
+        else:
+            if results is None:
+                yield {"type": "answer", "content": "抱歉，在知识库中未找到与您问题相关的信息。"}
+                return
+            if self._reranker and results:
+                results = await self._arerank_results(question, results)
+            formatted_context, sources = self._format_context(results)
+            trimmed_context, sources = self._trim_context(formatted_context, self._max_context_tokens, sources)
 
         yield {"type": "sources", "sources": sources}
 
@@ -381,6 +604,155 @@ class RAGPipeline:
     # ------------------------------------------------------------------
     # 内部方法
     # ------------------------------------------------------------------
+
+    def _try_fact_cache(
+        self, question: str, chat_history: list[dict[str, str]] | None, collector: MetricsCollector
+    ) -> dict[str, Any] | None:
+        """同步：尝试从FactCache命中回答。命中返回结果dict，未命中返回None。"""
+        if self._fact_cache is None:
+            return None
+        fact_results = self._fact_cache.search_by_text(question, threshold=self._fact_cache_threshold)
+        if not fact_results:
+            return None
+        logger.info("FactCache hit: %d facts for query: %s", len(fact_results), question[:50])
+        system_prompt, messages, sources = self._build_fact_prompt(question, chat_history, fact_results)
+        t_generate = perf_counter()
+        try:
+            answer = self._llm.chat(system_prompt, messages)
+        except Exception as e:
+            raise RAGPipelineError(f"LLM 生成失败: {e}") from e
+        generate_ms = (perf_counter() - t_generate) * 1000
+        collector.record(
+            QueryMetrics(
+                question=question[:50],
+                generate_ms=round(generate_ms, 2),
+                total_ms=round(generate_ms, 2),
+                cache_hit=True,
+                strategy="fact_cache",
+                num_sources=len(sources),
+            )
+        )
+        return {"answer": answer, "sources": sources}
+
+    async def _atry_fact_cache(
+        self, question: str, chat_history: list[dict[str, str]] | None, collector: MetricsCollector
+    ) -> dict[str, Any] | None:
+        """异步：尝试从FactCache命中回答。命中返回结果dict，未命中返回None。"""
+        if self._fact_cache is None:
+            return None
+        fact_results = await self._fact_cache.asearch_by_text(question, threshold=self._fact_cache_threshold)
+        if not fact_results:
+            return None
+        logger.info("FactCache hit (async): %d facts for query: %s", len(fact_results), question[:50])
+        system_prompt, messages, sources = self._build_fact_prompt(question, chat_history, fact_results)
+        t_generate = perf_counter()
+        try:
+            answer = await self._llm.achat(system_prompt, messages)
+        except Exception as e:
+            raise RAGPipelineError(f"LLM 异步生成失败: {e}") from e
+        generate_ms = (perf_counter() - t_generate) * 1000
+        collector.record(
+            QueryMetrics(
+                question=question[:50],
+                generate_ms=round(generate_ms, 2),
+                total_ms=round(generate_ms, 2),
+                cache_hit=True,
+                strategy="fact_cache",
+                num_sources=len(sources),
+            )
+        )
+        return {"answer": answer, "sources": sources}
+
+    def _build_fact_prompt(
+        self,
+        question: str,
+        chat_history: list[dict[str, str]] | None,
+        fact_results: list,
+    ) -> tuple[str, list[dict[str, str]], list[dict]]:
+        """从fact列表构造system_prompt、messages和sources。"""
+        fact_context = "\n\n".join(
+            f"[来源 {i+1}] {f.topic}: {f.fact}" for i, f in enumerate(fact_results)
+        )
+        system_prompt = Template(_SYSTEM_PROMPT_TEMPLATE).safe_substitute(
+            retrieved_documents=fact_context,
+            user_question=question,
+        )
+        messages = self._build_messages(
+            chat_history, question,
+            max_history_tokens=max(200, self._max_context_tokens * 2 // 5),
+        )
+        sources = [
+            {"content": f.fact, "score": 1.0, "metadata": {"topic": f.topic, "source": f.source}}
+            for f in fact_results
+        ]
+        return system_prompt, messages, sources
+
+    def _extract_and_cache_facts(self, sources: list[dict], question: str) -> None:
+        """从RAG结果中提取fact并存入缓存（同步调用，仅作fire-and-forget）。"""
+        if self._fact_cache is None or self._fact_extractor is None:
+            return
+        try:
+            context_text = "\n\n".join(s.get("content", "") for s in sources)
+            facts, triples = self._fact_extractor.extract(context_text, source=f"rag:{question[:30]}")
+            if facts:
+                self._fact_cache.add_facts(facts)
+                logger.info("Extracted and cached %d facts from RAG result", len(facts))
+            if triples and self._graph_store is not None:
+                graph_enabled = self._graph_config is not None and self._graph_config.enabled
+                if graph_enabled:
+                    try:
+                        count = self._graph_store.add_triples(triples)
+                        logger.info("Stored %d triples to graph store", count)
+                    except Exception as te:
+                        logger.warning("Triple storage failed: %s", te)
+        except Exception as e:
+            if not hasattr(self, "_fact_extract_failures"):
+                self._fact_extract_failures = 0
+            self._fact_extract_failures += 1
+            if self._fact_extract_failures <= 3 or self._fact_extract_failures % 50 == 0:
+                logger.warning("Fact extraction/cache storage failed (count=%d): %s", self._fact_extract_failures, e)
+
+    # ------------------------------------------------------------------
+    # 图路由
+    # ------------------------------------------------------------------
+
+    _COMPARISON_WORDS = re.compile(r"(对比|vs|比较|和|与|区别|差异)")
+    _CAUSAL_WORDS = re.compile(r"(为什么|原因|影响|导致|为什么|缘故|因素)")
+
+    def _route_query(self, query: str) -> str:
+        if self._graph_store is None:
+            return "rag"
+        known = self._graph_store.get_entities()
+        matched = [e for e in known if e in query]
+        if len(matched) >= 2 and self._COMPARISON_WORDS.search(query):
+            return "graph_comparison"
+        if self._CAUSAL_WORDS.search(query) and matched:
+            return "graph_causal"
+        return "rag"
+
+    def _try_graph_query(self, query: str) -> list[Triple] | None:
+        if self._graph_retriever is None or self._graph_config is None:
+            return None
+        if not self._graph_config.enabled:
+            return None
+        route = self._route_query(query)
+        if route == "graph_comparison":
+            triples = self._graph_retriever.retrieve(query, mode="comparison")
+        elif route == "graph_causal":
+            triples = self._graph_retriever.retrieve(query, mode="neighbors")
+        else:
+            return None
+        return triples if triples else None
+
+    @staticmethod
+    def _build_graph_prompt(triples: list[Triple], rag_context: str) -> str:
+        graph_section = "\n".join(
+            f"知识点: {t.head} {t.relation} {t.tail}" for t in triples
+        )
+        parts = [f"[图谱知识]\n{graph_section}"]
+        if rag_context:
+            parts.append(f"[文档来源]\n{rag_context}")
+        return "\n\n".join(parts)
 
     def _get_strategy_name(self) -> str:
         if isinstance(self._retriever, HybridRetriever):
@@ -551,6 +923,46 @@ class RAGPipeline:
         blended.sort(key=lambda x: x.score, reverse=True)
         logger.info("Position-Aware Rerank 完成：输入 %d 条，输出 %d 条", len(results), len(blended))
         return blended
+
+    # ------------------------------------------------------------------
+    # Agent 模式
+    # ------------------------------------------------------------------
+
+    def agent_query(
+        self,
+        task: str,
+        max_steps: int = 6,
+    ) -> dict[str, Any]:
+        """Agent 模式：支持多步推理。"""
+        if not task or not task.strip():
+            return {"answer": "请输入有效的任务。", "steps": []}
+        agent = self._create_agent(max_steps=max_steps)
+        answer = agent.run(task)
+        return {"answer": answer, "steps": agent.get_steps()}
+
+    async def aagent_query(
+        self,
+        task: str,
+        max_steps: int = 6,
+    ) -> dict[str, Any]:
+        """异步 Agent 模式。"""
+        if not task or not task.strip():
+            return {"answer": "请输入有效的任务。", "steps": []}
+        agent = self._create_agent(max_steps=max_steps)
+        answer = await agent.arun(task)
+        return {"answer": answer, "steps": agent.get_steps()}
+
+    def _create_agent(self, max_steps: int = 6) -> ReActAgent:
+        """从当前组件组装 ReActAgent。"""
+        tools: list[BaseTool] = [
+            FinancialSearchTool(self),
+            CalculatorTool(),
+        ]
+        return ReActAgent(llm=self._llm, tools=tools, max_steps=max_steps, tracer=self._tracer)
+
+    # ------------------------------------------------------------------
+    # 内部方法
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _build_messages(

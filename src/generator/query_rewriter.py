@@ -4,7 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from src.generator.siliconflow_llm import SiliconFlowLLM
+    from src.generator.mimo_llm import MimoLLM
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ _QUERY_REWRITE_SYSTEM_PROMPT = """\
 class QueryRewriter:
     """用 LLM 将多轮对话中的指代性问题改写为独立检索 query。"""
 
-    def __init__(self, llm: SiliconFlowLLM) -> None:
+    def __init__(self, llm: MimoLLM) -> None:
         self._llm = llm
 
     def rewrite(self, query: str, chat_history: list[dict[str, str]]) -> str:

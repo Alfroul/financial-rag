@@ -1,16 +1,22 @@
-"""查询 API 路由 — 同步查询、SSE 流式查询、健康检查、Metrics。"""
+"""查询 API 路由 — 同步查询、SSE 流式查询、WebSocket 流式查询、健康检查、Metrics。"""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
 import logging
 import time
 from collections.abc import AsyncGenerator
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sse_starlette.sse import EventSourceResponse
 
 from src.api.deps import get_pipeline, get_store
 from src.api.schemas import (
+    AgentQueryRequest,
+    AgentQueryResponse,
+    AgentStep,
     EvalRequest,
     EvalResponse,
     HealthResponse,
@@ -44,8 +50,8 @@ async def query(
                 pipeline=pipeline,
                 config=config.self_correction,
                 api_key=config.siliconflow_api_key,
-                base_url=config.self_correction.siliconflow_base_url,
-                model=config.self_correction.siliconflow_model,
+                base_url=config.self_correction.verifier_base_url,
+                model=config.self_correction.verifier_model,
             )
 
         kwargs: dict = {}
@@ -73,8 +79,8 @@ async def query(
             }
 
         return QueryResponse(
-            answer=result.get("answer", ""),
-            sources=result.get("sources", []),
+            answer=str(result.get("answer", "")),
+            sources=result.get("sources", []) or [],  # type: ignore[arg-type]
             cached=False,
             latency_ms=round(latency_ms, 2),
             correction=correction_data,
@@ -115,6 +121,31 @@ async def query_stream(
             yield {"event": "error", "data": json.dumps({"detail": str(e)}, ensure_ascii=False)}
 
     return EventSourceResponse(_generate())
+
+
+@router.post("/agent/query", response_model=AgentQueryResponse)
+async def agent_query(
+    body: AgentQueryRequest,
+    pipeline: RAGPipeline = Depends(get_pipeline),
+) -> AgentQueryResponse:
+    """Agent 模式查询：多步推理 + 工具调用。"""
+    t0 = time.perf_counter()
+    try:
+        result = await pipeline.aagent_query(
+            task=body.task,
+            max_steps=body.max_steps,
+        )
+        latency_ms = (time.perf_counter() - t0) * 1000
+        logger.info("Agent query completed in %.0fms, %d steps", latency_ms, len(result.get("steps", [])))
+
+        steps = [AgentStep(**s) for s in result.get("steps", [])]
+        return AgentQueryResponse(
+            answer=result.get("answer", ""),
+            steps=steps,
+        )
+    except Exception as e:
+        logger.error("Agent 查询失败: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Agent 查询失败: {e}") from e
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -202,3 +233,137 @@ async def clear_metrics() -> dict:
     collector = MetricsCollector()
     collector.clear()
     return {"status": "ok", "message": "Metrics cleared"}
+
+
+# ---------------------------------------------------------------------------
+# WebSocket 流式查询
+# ---------------------------------------------------------------------------
+
+_ip_connections: dict[str, int] = {}
+_MAX_CONNECTIONS_PER_IP = 5
+_IDLE_TIMEOUT = 60
+
+
+def _check_and_add_ip(ip: str) -> bool:
+    count = _ip_connections.get(ip, 0)
+    if count >= _MAX_CONNECTIONS_PER_IP:
+        return False
+    _ip_connections[ip] = count + 1
+    return True
+
+
+def _remove_ip(ip: str) -> None:
+    count = _ip_connections.get(ip, 0)
+    if count <= 1:
+        _ip_connections.pop(ip, None)
+    else:
+        _ip_connections[ip] = count - 1
+
+
+async def _listen_for_cancel(websocket: WebSocket, cancel: asyncio.Event) -> None:
+    try:
+        while not cancel.is_set():
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+                if data.get("type") == "cancel":
+                    cancel.set()
+                    return
+            except json.JSONDecodeError:
+                pass
+    except (WebSocketDisconnect, RuntimeError):
+        cancel.set()
+    except Exception:
+        cancel.set()
+
+
+async def _ws_stream_response(
+    websocket: WebSocket,
+    pipeline: RAGPipeline,
+    query_text: str,
+    options: dict,
+) -> None:
+    cancel = asyncio.Event()
+    listener = asyncio.create_task(_listen_for_cancel(websocket, cancel))
+
+    t0 = time.perf_counter()
+    token_count = 0
+
+    try:
+        kwargs: dict = {}
+        if "top_k" in options:
+            kwargs["top_k"] = options["top_k"]
+        if "chat_history" in options:
+            kwargs["chat_history"] = options["chat_history"]
+
+        async for chunk in pipeline.astream_query(question=query_text, **kwargs):
+            if cancel.is_set():
+                break
+            chunk_type = chunk.get("type")
+            if chunk_type == "sources":
+                await websocket.send_json({"type": "sources", "data": chunk["sources"]})
+            elif chunk_type == "answer":
+                token_count += 1
+                await websocket.send_json({"type": "token", "content": chunk.get("content", "")})
+
+        if not cancel.is_set():
+            latency_ms = (time.perf_counter() - t0) * 1000
+            await websocket.send_json({
+                "type": "metrics",
+                "data": {"latency_ms": round(latency_ms, 2), "tokens": token_count},
+            })
+            await websocket.send_json({"type": "done"})
+    except Exception as e:
+        logger.error("WebSocket streaming error: %s", e, exc_info=True)
+        with contextlib.suppress(Exception):
+            await websocket.send_json({"type": "error", "message": str(e)})
+        raise
+    finally:
+        listener.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await listener
+
+
+@router.websocket("/ws/chat")
+async def ws_chat(websocket: WebSocket) -> None:
+    """WebSocket 流式查询：逐 token 推送，支持取消和断连清理。"""
+    await websocket.accept()
+    client_ip = websocket.client.host if websocket.client else "unknown"
+
+    if not _check_and_add_ip(client_ip):
+        await websocket.close(code=1008, reason="too many connections")
+        return
+
+    try:
+        pipeline = get_pipeline()
+
+        while True:
+            try:
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=_IDLE_TIMEOUT)
+            except TimeoutError:
+                await websocket.close(code=1000, reason="idle timeout")
+                break
+
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "message": "invalid JSON"})
+                continue
+
+            msg_type = data.get("type")
+            if msg_type == "cancel":
+                continue
+            if msg_type != "query":
+                await websocket.send_json({"type": "error", "message": f"unknown message type: {msg_type}"})
+                continue
+
+            query_text = data.get("query", "")
+            options = data.get("options") or {}
+            await _ws_stream_response(websocket, pipeline, query_text, options)
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket client disconnected: %s", client_ip)
+    except Exception as e:
+        logger.error("WebSocket error for %s: %s", client_ip, e, exc_info=True)
+    finally:
+        _remove_ip(client_ip)

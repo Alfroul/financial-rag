@@ -10,6 +10,18 @@ services:
       - .env
     restart: unless-stopped
 
+  gradio:
+    build: .
+    container_name: financial-rag-gradio
+    command: python -m src.ui_gradio.app
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env
+    restart: unless-stopped
+
   api:
     build: .
     container_name: financial-rag-api
@@ -21,3 +33,17 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: financial-rag-neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+    volumes:
+      - neo4j_data:/data
+
+volumes:
+  neo4j_data:

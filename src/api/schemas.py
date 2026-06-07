@@ -115,3 +115,30 @@ class MetricsSummaryResponse(BaseModel):
     total_output_tokens: int = 0
     strategy_distribution: dict[str, int] = Field(default_factory=dict)
     recent_queries: list[dict] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Agent 相关
+# ---------------------------------------------------------------------------
+
+
+class AgentQueryRequest(BaseModel):
+    """Agent 查询请求。"""
+
+    task: str = Field(..., min_length=1, max_length=2000, description="分析任务描述")
+    max_steps: int = Field(default=6, ge=1, le=20, description="最大推理步数")
+
+
+class AgentStep(BaseModel):
+    """Agent 单步推理记录。"""
+
+    thought: str = ""
+    action: str = ""
+    observation: str = ""
+
+
+class AgentQueryResponse(BaseModel):
+    """Agent 查询响应。"""
+
+    answer: str
+    steps: list[AgentStep] = Field(default_factory=list)

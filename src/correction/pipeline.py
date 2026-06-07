@@ -32,8 +32,8 @@ class SelfCorrectingPipeline:
         pipeline: RAGPipeline,
         config: SelfCorrectionConfig,
         api_key: str | None = None,
-        base_url: str = "https://api.siliconflow.cn/v1",
-        model: str = "Qwen/Qwen3-8B",
+        base_url: str = "https://token-plan-cn.xiaomimimo.com/v1",
+        model: str = "mimo-v2.5-pro",
     ) -> None:
         self._pipeline = pipeline
         self._config = config
@@ -48,6 +48,11 @@ class SelfCorrectingPipeline:
             self._external = ExternalVerifier(
                 api_key=api_key, base_url=base_url, model=model,
             )
+
+    @property
+    def inner_pipeline(self) -> RAGPipeline:
+        """Access the underlying RAG pipeline for streaming before correction."""
+        return self._pipeline
 
     def query(
         self,

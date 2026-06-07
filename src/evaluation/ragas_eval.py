@@ -17,14 +17,18 @@ class RAGEvaluator:
     def __init__(
         self,
         api_key: str,
-        model: str = "Qwen/Qwen3-8B",
+        model: str = "mimo-v2-pro",
         embedding_model: str = "BAAI/bge-large-zh-v1.5",
-        base_url: str = "https://api.siliconflow.cn/v1",
+        base_url: str = "https://token-plan-cn.xiaomimimo.com/v1",
+        embedding_api_key: str | None = None,
+        embedding_base_url: str | None = None,
     ) -> None:
         self._api_key = api_key
         self._model = model
         self._embedding_model = embedding_model
         self._base_url = base_url
+        self._embedding_api_key = embedding_api_key or api_key
+        self._embedding_base_url = embedding_base_url or base_url
         self._llm: ChatOpenAI | None = None
 
     def _get_llm(self) -> ChatOpenAI:
@@ -36,7 +40,7 @@ class RAGEvaluator:
         self._llm = ChatOpenAI(
             model=self._model,
             base_url=self._base_url,
-            api_key=self._api_key,
+            api_key=self._api_key,  # type: ignore[arg-type]
             temperature=0,
         )
         return self._llm
@@ -51,9 +55,9 @@ class RAGEvaluator:
         # Local imports to keep dependencies lazy and testable
         from datasets import Dataset
         from langchain_openai import OpenAIEmbeddings
+        from ragas import RunConfig
         from ragas import evaluate as ragas_evaluate
         from ragas.metrics import (
-            answer_relevancy,
             context_precision,
             context_recall,
             faithfulness,
@@ -69,17 +73,25 @@ class RAGEvaluator:
 
         dataset: Dataset = Dataset.from_dict(data_dict)
 
-        metrics = [faithfulness, answer_relevancy, context_precision]
+        metrics = [faithfulness, context_precision]
         if references:
             metrics.append(context_recall)
 
         embeddings = OpenAIEmbeddings(
             model=self._embedding_model,
-            base_url=self._base_url,
-            api_key=self._api_key,
+            base_url=self._embedding_base_url,
+            api_key=self._embedding_api_key,  # type: ignore[arg-type]
         )
 
-        eval_result = ragas_evaluate(dataset, metrics=metrics, llm=self._get_llm(), embeddings=embeddings)
+        run_config = RunConfig(max_workers=2, max_retries=10, max_wait=60)
+
+        eval_result = ragas_evaluate(
+            dataset,
+            metrics=metrics,
+            llm=self._get_llm(),
+            embeddings=embeddings,
+            run_config=run_config,
+        )
 
         # ragas 0.4+: EvaluationResult._repr_dict is {metric_name: average_score}
         if hasattr(eval_result, "_repr_dict"):

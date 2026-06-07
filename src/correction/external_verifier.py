@@ -19,13 +19,13 @@ _SYSTEM_PROMPT = (
 
 
 class ExternalVerifier:
-    """Layer 4: External model (SiliconFlow Qwen3-8B) verification."""
+    """Layer 4: External model (mimo-v2.5-pro) verification."""
 
     def __init__(
         self,
         api_key: str,
-        base_url: str = "https://api.siliconflow.cn/v1",
-        model: str = "Qwen/Qwen3-8B",
+        base_url: str = "https://token-plan-cn.xiaomimimo.com/v1",
+        model: str = "mimo-v2.5-pro",
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")

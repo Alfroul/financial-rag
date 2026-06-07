@@ -1,17 +1,76 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from uuid import uuid4
 
 import streamlit as st
 
 from src.config import Config
+from src.embeddings.siliconflow_embedder import SiliconFlowEmbedder
+from src.fact_cache.store import FactCacheStore
+from src.fact_cache.sync import CacheSynchronizer, DataSourceWatcher
+from src.fact_extractor.extractor import FactExtractor
 from src.metrics.collector import MetricsCollector
 from src.ui.services import _init_vectorstore
 
 logger = logging.getLogger(__name__)
 
 config = Config()
+
+
+def _render_sync_section() -> None:
+    """渲染缓存同步区域。"""
+    if "last_sync_time" not in st.session_state:
+        st.session_state.last_sync_time = None
+    if "last_sync_result" not in st.session_state:
+        st.session_state.last_sync_result = None
+
+    # 显示上次同步信息
+    if st.session_state.last_sync_time:
+        st.caption(f"上次同步: {st.session_state.last_sync_time}")
+    if st.session_state.last_sync_result:
+        r = st.session_state.last_sync_result
+        st.caption(
+            f"变更: +{r.added} ~{r.modified} -{r.deleted} | "
+            f"更新 {r.facts_updated} 条fact"
+        )
+
+    if st.button("同步缓存", use_container_width=True, key="sync_cache"):
+        with st.spinner("正在同步..."):
+            try:
+                api_key = st.session_state.api_key or ""
+                if not api_key:
+                    st.warning("请先配置 API Key")
+                    return
+
+                embedder = SiliconFlowEmbedder(api_key=api_key, model=config.embedding.model)
+                fact_cache = FactCacheStore(
+                    embedder=embedder,
+                    collection_name=config.fact_cache.collection_name,
+                )
+                fact_extractor = FactExtractor(api_key=api_key)
+
+                watcher = DataSourceWatcher(
+                    data_directory=config.sync.data_directory,
+                    hash_file=config.sync.hash_file,
+                )
+                synchronizer = CacheSynchronizer(
+                    cache=fact_cache,
+                    extractor=fact_extractor,
+                    watcher=watcher,
+                    data_directory=config.sync.data_directory,
+                    judge_api_key=api_key,
+                    judge_model=config.sync.judge_model,
+                    judge_base_url=config.sync.judge_base_url,
+                )
+                result = synchronizer.manual_sync()
+                st.session_state.last_sync_result = result
+                st.session_state.last_sync_time = datetime.now().strftime("%H:%M:%S")
+                st.success(f"同步完成: {result.facts_updated} 条fact已更新")
+            except Exception as e:
+                logger.error("Sync failed: %s", e, exc_info=True)
+                st.error(f"同步失败: {e}")
 
 
 def render_sidebar() -> None:
@@ -92,13 +151,23 @@ def render_sidebar() -> None:
         st.subheader("MODEL PARAMETERS")
         model = st.selectbox(
             "Model",
-            ["Qwen/Qwen3-8B", "Qwen/Qwen2.5-7B-Instruct", "internlm/internlm2_5-7b-chat"],
-            index=["Qwen/Qwen3-8B", "Qwen/Qwen2.5-7B-Instruct", "internlm/internlm2_5-7b-chat"].index(config.llm.model)
-            if config.llm.model in ("Qwen/Qwen3-8B", "Qwen/Qwen2.5-7B-Instruct", "internlm/internlm2_5-7b-chat")
+            ["mimo-v2-pro", "mimo-v2.5", "mimo-v2.5-Pro"],
+            index=["mimo-v2-pro", "mimo-v2.5", "mimo-v2.5-Pro"].index(config.llm.model)
+            if config.llm.model in ("mimo-v2-pro", "mimo-v2.5", "mimo-v2.5-Pro")
             else 0,
         )
         temperature = st.slider("Temperature", 0.0, 1.0, config.llm.temperature, 0.1)
         max_tokens = st.slider("Max Tokens", 256, 4096, config.llm.max_tokens, 256)
+
+        st.markdown('<hr style="border-color:rgba(201,168,76,0.15);margin:0.6rem 0;">', unsafe_allow_html=True)
+        st.subheader("QUERY MODE")
+        query_mode = st.radio(
+            "Query Mode",
+            ["问答模式", "分析模式"],
+            index=0,
+            help="问答模式：单次检索回答。分析模式：Agent 多步推理，支持工具调用。",
+        )
+        st.session_state.query_mode = "agent" if query_mode == "分析模式" else "qa"
 
         st.markdown('<hr style="border-color:rgba(201,168,76,0.15);margin:0.6rem 0;">', unsafe_allow_html=True)
         st.subheader("RETRIEVAL")
@@ -163,6 +232,13 @@ def render_sidebar() -> None:
         st.session_state.self_correction_enabled = self_correction_enabled
         st.session_state.chunk_size = chunk_size
         st.session_state.chunk_overlap = chunk_overlap
+
+        st.markdown('<hr style="border-color:rgba(201,168,76,0.15);margin:0.6rem 0;">', unsafe_allow_html=True)
+        st.subheader("CACHE SYNC")
+        if config.fact_cache.enabled:
+            _render_sync_section()
+        else:
+            st.caption("Fact Cache disabled — sync unavailable")
 
         st.markdown('<hr style="border-color:rgba(201,168,76,0.15);margin:0.6rem 0;">', unsafe_allow_html=True)
         st.subheader("SYSTEM METRICS")

@@ -5,7 +5,7 @@ import logging
 import streamlit as st
 
 from src.correction.types import ClaimVerdict, CorrectionResult, RetrievalQuality
-from src.generator.siliconflow_llm import (
+from src.generator.mimo_llm import (
     LLMAuthError,
     LLMError,
     LLMQuotaError,
@@ -92,6 +92,21 @@ def render_chat_tab() -> None:
     for msg in messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+            if msg["role"] == "assistant" and msg.get("agent_steps"):
+                with st.expander("Agent 思考过程", expanded=False):
+                    for i, step in enumerate(msg["agent_steps"]):
+                        thought = step.get("thought", "")
+                        action = step.get("action", "")
+                        observation = step.get("observation", "")
+                        st.markdown(f"**Step {i + 1}**")
+                        if thought:
+                            st.markdown(f"```\n{thought}\n```")
+                        if action:
+                            st.markdown(f"**Action:** `{action}`")
+                        if observation:
+                            st.markdown(f"**Observation:** {observation}")
+                        if i < len(msg["agent_steps"]) - 1:
+                            st.divider()
             if msg["role"] == "assistant" and msg.get("sources"):
                 with st.expander("References", expanded=False):
                     for src in msg["sources"]:
@@ -141,12 +156,36 @@ def render_chat_tab() -> None:
             try:
                 pipeline = _build_rag_pipeline(api_key=api_key)
                 use_correction = getattr(st.session_state, "self_correction_enabled", False)
+                is_agent_mode = getattr(st.session_state, "query_mode", "qa") == "agent"
 
                 sources: list[dict] = []
                 answer = ""
                 correction_data: CorrectionResult | None = None
 
-                if use_correction:
+                if is_agent_mode:
+                    status.update(label="Agent reasoning...")
+                    result = pipeline.agent_query(task=prompt)  # type: ignore[union-attr]
+                    answer = str(result.get("answer", ""))
+                    agent_steps = result.get("steps", [])
+                    st.markdown(answer)
+                    if agent_steps:
+                        with st.expander("Agent 思考过程", expanded=False):
+                            for i, step in enumerate(agent_steps):
+                                thought = step.get("thought", "")
+                                action = step.get("action", "")
+                                observation = step.get("observation", "")
+                                st.markdown(f"**Step {i + 1}**")
+                                if thought:
+                                    st.markdown(f"```\n{thought}\n```")
+                                if action:
+                                    st.markdown(f"**Action:** `{action}`")
+                                if observation:
+                                    st.markdown(f"**Observation:** {observation}")
+                                if i < len(agent_steps) - 1:
+                                    st.divider()
+                    status.update(label="Agent complete", state="complete")
+
+                elif use_correction:
                     status.update(label="Generating and verifying response...")
                     result = pipeline.query(
                         question=prompt,
@@ -181,7 +220,7 @@ def render_chat_tab() -> None:
                 if correction_data:
                     _render_correction_info(correction_data)
 
-                msg_data = {
+                msg_data: dict[str, object] = {
                     "role": "assistant",
                     "content": answer,
                     "sources": sources,
@@ -189,6 +228,8 @@ def render_chat_tab() -> None:
                 }
                 if correction_data:
                     msg_data["correction"] = correction_data
+                if is_agent_mode and agent_steps:
+                    msg_data["agent_steps"] = agent_steps
                 messages.append(msg_data)
 
             except LLMAuthError as e:
